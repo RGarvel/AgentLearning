@@ -1,0 +1,420 @@
+{
+  "0": [
+    {
+      "q": "课程把能力分为三层，其中「会排查」对应哪一段模块？",
+      "options": [
+        "0、1、2、6",
+        "3、4、5、7",
+        "8、9、10",
+        "11、12、13"
+      ],
+      "answer": 2,
+      "explain": "三层结构是用会（0/1/2/6）、会设计（3/4/5/7）、会排查（8/9/10）；11-13 属于多智能体编排模块，不在这张划分表里。",
+      "level": "easy"
+    },
+    {
+      "q": "四步学习法的第三步「改坏」应该改什么？",
+      "options": [
+        "逐字修改 prompt 措辞",
+        "仓库里的 tests 断言",
+        "锁定文件里的版本号",
+        "结构性要素：参数、类型、顺序"
+      ],
+      "answer": 3,
+      "explain": "本章明确要求改结构性的东西，因为 Agent 行为非确定，改 prompt 措辞会让你误判原因；改坏后要观察报错并记录症状与修法。",
+      "level": "medium"
+    },
+    {
+      "q": "想知道 max_turns 超限时抛什么异常、信息长什么样，按本章建议最省力的路径是？",
+      "options": [
+        "通读 run_internal 全部源码",
+        "grep 关键词后看 tests 里的断言",
+        "只读 docs 里的 note 块",
+        "直接跑一次并凭感觉猜原因"
+      ],
+      "answer": 1,
+      "explain": "本章主张先 grep 关键词再看测试断言，测试是唯一不会骗人的规格说明；源码是产生疑问后的验证手段，不是学习起点。",
+      "level": "hard"
+    }
+  ],
+  "1": [
+    {
+      "q": "按本章的最小定义，Agent 的四个部件中哪一个「你不声明它也存在」？",
+      "options": [
+        "模型",
+        "指令",
+        "工具",
+        "循环"
+      ],
+      "answer": 3,
+      "explain": "四个部件是模型、指令、工具、循环；循环由 Runner 持有，不配置也一直在跑，区别只在于你是否知道它跑了几轮、为什么停。",
+      "level": "easy"
+    },
+    {
+      "q": "下列哪种需求最适合直接调用 Responses API，而不是用 Agents SDK？",
+      "options": [
+        "一次分类、摘要或抽取",
+        "需要护栏、交接与会话持久化",
+        "模型要自己决定调几次工具",
+        "需要可恢复的中断执行"
+      ],
+      "answer": 0,
+      "explain": "官方分工是：单次补全、分类、摘要直接打 API；需要受管循环、护栏、交接、会话或可恢复执行时才用 SDK，两者也可以混用。",
+      "level": "medium"
+    },
+    {
+      "q": "写了很详细的 instructions，指望模型自己分多步完成，结果每次都只回一段话。最可能的原因？",
+      "options": [
+        "instructions 太长被截断",
+        "max_turns 默认值太小",
+        "没有工具，第一轮就满足了停止条件",
+        "模型不支持函数式 instructions"
+      ],
+      "answer": 2,
+      "explain": "停止规则是「期望类型的文本 + 无工具调用」，没有工具模型就没有再来一轮的理由；修法是给它工具或拆成多次 Runner.run。",
+      "level": "hard"
+    }
+  ],
+  "2": [
+    {
+      "q": "想知道某个模块的边界情况怎么处理，最该先查仓库的哪个区域？",
+      "options": [
+        "src/agents",
+        "docs",
+        "tests",
+        "integration_tests"
+      ],
+      "answer": 2,
+      "explain": "五个区域的分工是：src 是权威、docs 是意图、tests 是规格、integration_tests 验证真实环境；边界情况看测试最准。",
+      "level": "easy"
+    },
+    {
+      "q": "关于 API Key 与 .env，下列哪项说法正确？",
+      "options": [
+        "SDK 会自动加载项目根目录的 .env",
+        "必须在 import agents 之前设好环境变量",
+        "key 直到第一次创建 OpenAI 客户端时才读取",
+        "只要用 uv 运行就会自动读 .env"
+      ],
+      "answer": 2,
+      "explain": "key 是惰性解析，import 时设也能生效，但模型调用之后才设必然失败；SDK 不会自动加载 .env，需要 uv run --env-file 或自己 load_dotenv。",
+      "level": "medium"
+    },
+    {
+      "q": "pip 安装成功，运行却报 No module named 'agents'，最该先做什么？",
+      "options": [
+        "升级到 Python 3.14",
+        "改用 uv sync --all-extras",
+        "关掉 tracing 后重试",
+        "打印 sys.executable 核对解释器是否装错"
+      ],
+      "answer": 3,
+      "explain": "典型原因是装到了另一个解释器（系统 Python 与虚拟环境混用）；先看 sys.executable，之后统一用 uv run python 启动。",
+      "level": "hard"
+    }
+  ],
+  "3": [
+    {
+      "q": "RealtimeAgent 刻意不支持下列哪个字段？",
+      "options": [
+        "name",
+        "handoff_description",
+        "tools",
+        "output_type"
+      ],
+      "answer": 3,
+      "explain": "RealtimeAgent 直接继承基类，砍掉了 model、model_settings、output_type、tool_use_behavior，因为一个实时 session 里所有 Agent 共用一个实时模型。",
+      "level": "easy"
+    },
+    {
+      "q": "base.clone 只改了 name 得到 oops，随后 oops.tools.append 一个新工具，会发生什么？",
+      "options": [
+        "抛出 UserError，禁止修改",
+        "只有 oops 的工具表变化",
+        "base.tools 也被一起改动",
+        "深拷贝，两边都不受影响"
+      ],
+      "answer": 2,
+      "explain": "clone 是浅拷贝，未传的 list 字段与原对象共享同一个容器；原地 append 又不走 __setattr__ 检查，所以连 base 都被悄悄污染。",
+      "level": "medium"
+    },
+    {
+      "q": "给 Agent 传了一个只接收一个参数的 instructions 函数，运行时报 TypeError，修法是？",
+      "options": [
+        "补成 (ctx, agent) 两个位置参数",
+        "改成 async def 即可",
+        "instructions 只能传字符串",
+        "改为返回 Prompt 字典"
+      ],
+      "answer": 0,
+      "explain": "动态指令签名固定为 (RunContextWrapper[TContext], Agent[TContext])，不需要 agent 就写 _agent；async def 本来就合法，不是问题所在。",
+      "level": "hard"
+    }
+  ],
+  "4": [
+    {
+      "q": "在 FastAPI 的异步请求处理函数里要跑一次 Agent，应该用哪个入口？",
+      "options": [
+        "Runner.run_sync",
+        "await Runner.run",
+        "asyncio.run(Runner.run(...))",
+        "run_streamed 之后立刻读 final_output"
+      ],
+      "answer": 1,
+      "explain": "run_sync 只是 run 的包装，需要新建事件循环，已有事件循环时会报错；流式对象也要先消费完事件，final_output 才有值。",
+      "level": "easy"
+    },
+    {
+      "q": "设 max_turns=5，raw_responses 恰好 5 条却抛 MaxTurnsExceeded，为什么？",
+      "options": [
+        "循环先自增再比较，第 6 轮在调用模型前就被拦下",
+        "每次工具调用也算一个 turn",
+        "handoff 会额外多计一轮",
+        "传入的 max_turns 被默认值覆盖"
+      ],
+      "answer": 0,
+      "explain": "turn 计数发生在模型调用之前，异常里的数字是被拒绝的那一轮；把 max_turns 理解为最多允许几次模型调用即可。",
+      "level": "medium"
+    },
+    {
+      "q": "一次 run 结束后，怎么可靠判断中途是否发生过交接？",
+      "options": [
+        "比较 last_agent 与入口 Agent 是否相同",
+        "看 final_output 是不是 str",
+        "遍历 new_items 找 HandoffOutputItem",
+        "看 result.input 是否为空"
+      ],
+      "answer": 2,
+      "explain": "last_agent 只记最后执行者，可能又交回入口；只有 HandoffOutputItem 明确记录了 source_agent 与 target_agent。",
+      "level": "hard"
+    }
+  ],
+  "5": [
+    {
+      "q": "发生交接之后，result.final_output 的类型由谁决定？",
+      "options": [
+        "入口 Agent 的 output_type",
+        "RunConfig 里的统一配置",
+        "SDK 固定返回 str",
+        "最后跑完的那个 Agent"
+      ],
+      "answer": 3,
+      "explain": "final_output 的类型跟随最后跑完的 Agent；交接换人后类型可能和预期不符，常见的修法是给所有可能收尾的 Agent 设一致的 output_type。",
+      "level": "easy"
+    },
+    {
+      "q": "关于 final_output_as(Ticket)，哪项说法正确？",
+      "options": [
+        "默认会校验类型，不符抛 TypeError",
+        "它返回 JSON 字符串",
+        "默认只做类型标注不校验，生产建议传 raise_if_incorrect_type=True",
+        "它等价于 to_input_list"
+      ],
+      "answer": 2,
+      "explain": "默认 raise_if_incorrect_type=False 只是给类型检查器看的 cast，运行时完全信任你；打开后类型不符会在最早的地方炸掉，而不是留到下游 AttributeError。",
+      "level": "medium"
+    },
+    {
+      "q": "items 序列里出现了 handoff_call_item，却没有对应的 tool_call_item，说明什么？",
+      "options": [
+        "SDK 把交接请求单列为交接项，不额外产生 tool_call_item",
+        "交接失败，需要重跑",
+        "模型这一轮没有发起任何函数调用",
+        "该 run 触发了护栏熔断"
+      ],
+      "answer": 0,
+      "explain": "交接在模型眼里就是一次函数调用，但 SDK 把它单列成 handoff_call_item；只有 handoff_output_item 带 source_agent 与 target_agent，判断真的换人要找它。",
+      "level": "hard"
+    }
+  ],
+  "6": [
+    {
+      "q": "把用户余额放进 RunContextWrapper 的 context 里，模型会知道这个数字吗？",
+      "options": [
+        "不会，context 不会发送给模型",
+        "会，SDK 自动拼进 system prompt",
+        "会，但只在第一轮有效",
+        "会，只要 Agent 的泛型参数写对"
+      ],
+      "answer": 0,
+      "explain": "本地 context 只给你自己的工具、护栏、钩子用；要让模型知道必须写进 instructions、放进 input，或提供工具按需查询。",
+      "level": "easy"
+    },
+    {
+      "q": "工具里需要用 tool_call_id 做幂等键，正确的写法是？",
+      "options": [
+        "从 ctx.context 里读 tool_call_id",
+        "用 RunContextWrapper 的 tool_input 字段",
+        "from agents import ToolContext 并作为第一个参数",
+        "from agents.tool_context import ToolContext 并作为第一个参数"
+      ],
+      "answer": 3,
+      "explain": "ToolContext 是 RunContextWrapper 的子类，多了 tool_name、tool_call_id、tool_arguments；但它不在 agents 顶层导出，必须从 agents.tool_context 导入。",
+      "level": "medium"
+    },
+    {
+      "q": "从 RunState 恢复后，工具里的 ctx.context 变成了空 dict，最可能的原因与修法是？",
+      "options": [
+        "忘了传 context=，重新传一次即可",
+        "usage 被 deepcopy 导致的，忽略即可",
+        "原 context 是自定义类，序列化时退化，需要 context_serializer 或改用 mapping",
+        "工具的第一个参数位置写错了"
+      ],
+      "answer": 2,
+      "explain": "RunState 持久化会尝试序列化 context，非 mapping 且没有 serializer 时退化为空 dict 并告警；strict_context=True 能让它在丢数据前直接报错。",
+      "level": "hard"
+    }
+  ],
+  "7": [
+    {
+      "q": "关于 @tool 与 @function_tool，哪项说法正确？",
+      "options": [
+        "两者等价，tool 就是 function_tool 的别名",
+        "两者功能不同，@tool 不支持 context",
+        "@function_tool 已废弃，不能再用",
+        "@tool 只能装饰 async 函数"
+      ],
+      "answer": 0,
+      "explain": "decorators.py 里只有一句 tool = function_tool；官方 0.25 的示例统一用 @tool，同步与异步函数都支持。",
+      "level": "easy"
+    },
+    {
+      "q": "工具函数 return 一个 dict，模型实际看到什么？",
+      "options": [
+        "标准 JSON 字符串",
+        "Pydantic 校验错误",
+        "str() 出来的 Python repr，带单引号",
+        "自动转成 ToolOutputText"
+      ],
+      "answer": 2,
+      "explain": "只有 str 和 ToolOutput* 被正确理解，其他对象走 str(output)；要结构化数据就自己 json.dumps，或返回 ToolOutputText 并在文本里放 JSON。",
+      "level": "medium"
+    },
+    {
+      "q": "给一个同步工具加上 timeout=2.0，构造阶段就抛 ValueError，原因是？",
+      "options": [
+        "timeout 的单位应该写成毫秒",
+        "还必须同时设 timeout_behavior",
+        "同步工具必须加 needs_approval",
+        "超时只支持异步工具，同步工具跑在线程里取消不保证"
+      ],
+      "answer": 3,
+      "explain": "报错原文是 only supported for async @function_tool handlers；要超时就改成 async def，或在外层自己用 asyncio.wait_for。",
+      "level": "hard"
+    }
+  ],
+  "8": [
+    {
+      "q": "关于托管工具（hosted tool），哪项描述正确？",
+      "options": [
+        "执行在 OpenAI 服务端，你只能看到 raw_item 条目，调用前无法介入",
+        "能在工具内部对调用参数做鉴权",
+        "结果可以用 failure_error_function 定制",
+        "平台费用会计入 RunContextWrapper.usage"
+      ],
+      "answer": 0,
+      "explain": "托管工具没有回调，参数不经过你的进程，所以不能在工具里鉴权；usage 只累计模型 token，平台费用要去用量页对账。",
+      "level": "easy"
+    },
+    {
+      "q": "给托管模式的 ShellTool 同时传 environment 与 executor，会怎样？",
+      "options": [
+        "executor 优先，按本地模式执行",
+        "自动降级为本地模式",
+        "抛 UserError，托管模式不允许给 executor、needs_approval、on_approval",
+        "只能在 container_reference 下这么写"
+      ],
+      "answer": 2,
+      "explain": "environment 省略才是本地模式，且本地模式必须给 executor；一旦给了 environment 就走托管，executor 与审批参数一律禁止。",
+      "level": "medium"
+    },
+    {
+      "q": "FileSearchTool 一直搜不到内容，最可能的原因与修法是？",
+      "options": [
+        "max_num_results 设太大，改小",
+        "没开 cache_tools_list",
+        "缺少 include_search_results",
+        "向量库还在 in_progress，用 create_and_poll 等索引完成"
+      ],
+      "answer": 3,
+      "explain": "向量库要先上传文件、建 store、再用 create_and_poll 等索引完成，之后才发起 run；搜不到与条数上限、缓存开关无关。",
+      "level": "hard"
+    }
+  ],
+  "9": [
+    {
+      "q": "新接入一个远端 MCP server，应优先选哪种传输？",
+      "options": [
+        "MCPServerSse",
+        "MCPServerStdio",
+        "MCPServerStreamableHttp",
+        "HostedMCPTool"
+      ],
+      "answer": 2,
+      "explain": "SSE 已被 MCP 项目标记废弃，只用于兼容老 server；远端首选 Streamable HTTP，本地命令行 server 才用 stdio。",
+      "level": "easy"
+    },
+    {
+      "q": "关于 MCPServerManager 的默认行为，哪项正确？",
+      "options": [
+        "drop_failed_servers 默认 True，active_servers 只含连上的 server",
+        "任一 server 连接失败就抛异常",
+        "会自动无限重连失败的 server",
+        "必须先手动 connect_all 才能进入 async with"
+      ],
+      "answer": 0,
+      "explain": "默认只把成功连接的放进 active_servers，失败项在 failed_servers 与 errors 里；要「缺一个就不跑」得传 strict=True。",
+      "level": "medium"
+    },
+    {
+      "q": "两个 MCP server 都提供 read_file，模型却只看到一个，正确修法是？",
+      "options": [
+        "调小 client_session_timeout_seconds",
+        "关掉 cache_tools_list",
+        "改用 create_static_tool_filter",
+        "开 mcp_config 的 include_server_in_tool_names 加 server 前缀"
+      ],
+      "answer": 3,
+      "explain": "同名工具会被静默择一，打开后变成 mcp_服务器名__工具名 的形式；还可配 tool_name_collision_policy=error 让重名在模型调用前就暴露。",
+      "level": "hard"
+    }
+  ],
+  "10": [
+    {
+      "q": "as_tool 与 handoff 的根本差别是什么？",
+      "options": [
+        "as_tool 生成输入并保留控制权，子 Agent 跑完回来汇报",
+        "as_tool 会把控制权转移给子 Agent",
+        "as_tool 会把完整对话历史传给子 Agent",
+        "as_tool 的子 Agent 不能被并行调用"
+      ],
+      "answer": 0,
+      "explain": "as_tool 返回 FunctionTool，新开一次嵌套 run，输入是你生成的，控制权不外移；handoff 才转移控制权并默认带完整历史。",
+      "level": "easy"
+    },
+    {
+      "q": "设了 stop_on_first_tool，但 WebSearchTool 的结果没有被当最终答案，为什么？",
+      "options": [
+        "应该改用 StopAtTools",
+        "还需要把 reset_tool_choice 设为 False",
+        "该开关只对 FunctionTool 生效，托管工具结果永远由模型处理",
+        "必须给 Agent 设 output_type"
+      ],
+      "answer": 2,
+      "explain": "tool_use_behavior 只作用于函数工具；托管工具无法用它截断，只能包成函数工具或改用自定义结束条件。",
+      "level": "medium"
+    },
+    {
+      "q": "嵌套 run 超了轮次，外层却「正常返回」一句脱敏文案，为什么？",
+      "options": [
+        "外层 max_turns 更大，覆盖了内层",
+        "嵌套 run 不受 max_turns 约束",
+        "需要给嵌套工具设 needs_approval",
+        "failure_error_function 默认把失败转成脱敏文案，传 None 才会抛异常"
+      ],
+      "answer": 3,
+      "explain": "as_tool 的 failure_error_function 默认是 default_tool_error_function；要可诊断就显式传 None 或自定义函数带上受控信息。",
+      "level": "hard"
+    }
+  ]
+}

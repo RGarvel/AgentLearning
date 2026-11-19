@@ -1,0 +1,420 @@
+{
+  "11": [
+    {
+      "q": "manager 与 handoff 最本质的区别是什么？",
+      "options": [
+        "最终面向用户的答案由中心 Agent 给出，还是由接手的专家给出",
+        "是否允许专家拥有自己的 instructions",
+        "是否需要使用工具",
+        "是否支持并行调用多个模型"
+      ],
+      "answer": 0,
+      "explain": "判断轴是“谁拥有最终答案”：manager 由中心 Agent 汇总后统一回复，handoff 则由接手专家直接对用户说话。两者都可能带工具和独立 instructions，不能用来区分。",
+      "level": "easy"
+    },
+    {
+      "q": "关于 parallel 模式的成本，正文的结论是？",
+      "options": [
+        "并行调用只按最慢的那个 worker 计费",
+        "并行一定比串行便宜，因为总延迟更低",
+        "并行调用共享同一份输入 token，不额外计费",
+        "每个 `Runner.run` 都是独立计费的调用，N 个 worker 就是 N 份输入 token"
+      ],
+      "answer": 3,
+      "explain": "并行不是免费：gather 里每个 `Runner.run` 都是独立模型调用，而且往往重复携带同一段指令。延迟低不等于成本低。",
+      "level": "medium"
+    },
+    {
+      "q": "manager 模式中专家工具抛异常，中心 Agent 却编了段答复，原因与修法是？",
+      "options": [
+        "没有用 with trace 包住工作流，应补上",
+        "evaluator 循环没有轮次上限，应加 for 循环",
+        "as_tool 默认的 failure_error_function 把异常转成脱敏文案，应设为 None 让异常抛出",
+        "asyncio.gather 没有加 return_exceptions，应加上"
+      ],
+      "answer": 2,
+      "explain": "默认的 failure_error_function 会把失败变成一句脱敏文案交给中心 Agent，它往往会礼貌地编一个答案，这在客服场景是事故。",
+      "level": "hard"
+    }
+  ],
+  "12": [
+    {
+      "q": "handoff 在运行时最准确的描述是？",
+      "options": [
+        "启动一个独立进程执行目标 Agent",
+        "一次工具调用加一次 Agent 切换，全程在同一个 run 内",
+        "新开一个 run 和一条新的 trace",
+        "把目标 Agent 当工具调用一次后返回原 Agent"
+      ],
+      "answer": 1,
+      "explain": "交接对模型就是一个工具：写入 HandoffCallItem、切换当前 Agent，然后继续同一个 run，共享 usage 与 max_turns。",
+      "level": "easy"
+    },
+    {
+      "q": "关于 handoff 的 input_type，正确说法是？",
+      "options": [
+        "只描述交接工具的参数，必须同时提供 on_handoff，签名是 (ctx, input)",
+        "它用于替换下一个 Agent 的主输入",
+        "由它决定交接给哪个目标 Agent",
+        "可以单独使用，不必提供 on_handoff"
+      ],
+      "answer": 0,
+      "explain": "给了 input_type 却没给 on_handoff 会直接 UserError；它只装模型当场决定的元数据，应用状态应放 RunContextWrapper.context。",
+      "level": "medium"
+    },
+    {
+      "q": "多级交接设了 RunConfig(nest_handoff_history=True) 却毫无变化，最可能原因是？",
+      "options": [
+        "没有调用 set_conversation_history_wrappers",
+        "目标 Agent 没有写 instructions",
+        "没有给交接配 input_type",
+        "同时设了 handoff 级或 run 级的 input_filter，自动嵌套被跳过"
+      ],
+      "answer": 3,
+      "explain": "只要任一层级设了 input_filter，自动嵌套就不生效，二者只能选一个。嵌套摘要也不是脱敏机制，工具参数可能原样进摘要。",
+      "level": "hard"
+    }
+  ],
+  "13": [
+    {
+      "q": "决定沙箱这次跑在哪个后端、哪个镜像的配置应放在哪里？",
+      "options": [
+        "SandboxAgent 的 capabilities 列表",
+        "Manifest 的 root 字段",
+        "RunConfig(sandbox=SandboxRunConfig(...))",
+        "SandboxAgent 的 default_manifest"
+      ],
+      "answer": 2,
+      "explain": "Agent 定义只管做什么，运行期后端由 SandboxRunConfig 决定，同一份 Agent 才能在本地、Docker 与托管之间切换。",
+      "level": "easy"
+    },
+    {
+      "q": "SandboxAgent 写了 capabilities=[Shell()] 后不能改文件，原因是？",
+      "options": [
+        "因为 Manifest 里没有声明 entries",
+        "该列表整体替换默认值，Filesystem 被删掉，应写 Capabilities.default() + [...]",
+        "Shell 本身不包含执行命令的能力",
+        "因为没有设置 run_as"
+      ],
+      "answer": 1,
+      "explain": "默认是 Filesystem + Shell + Compaction；显式传列表会整体替换而不是合并。要保留默认能力就显式列全或用默认值拼接。",
+      "level": "medium"
+    },
+    {
+      "q": "改了 agent.default_manifest 后重跑，沙箱里的文件却没变，最可能原因是？",
+      "options": [
+        "这次运行复用了已有 session，或从 snapshot / session_state 恢复",
+        "因为沙箱镜像里没有安装 git",
+        "因为 capabilities 里缺少 Compaction",
+        "因为没有设置 SandboxRunConfig.cwd"
+      ],
+      "answer": 0,
+      "explain": "manifest 只是新建沙箱会话的工作区契约；复用 session、snapshot 或 session_state 时，工作区内容由它们决定。",
+      "level": "hard"
+    }
+  ],
+  "14": [
+    {
+      "q": "输入护栏函数的参数顺序是？",
+      "options": [
+        "(input, agent, context)",
+        "(agent, context, input)",
+        "(input, context, agent)",
+        "(context, agent, input)"
+      ],
+      "answer": 3,
+      "explain": "顺序与直觉相反，写反不会报错，只会在运行时拿到奇怪的值。第三个参数可能是字符串，也可能是多轮对话的 item 列表。",
+      "level": "easy"
+    },
+    {
+      "q": "要保证 trip 时模型一次都没跑，输入护栏应怎么配？",
+      "options": [
+        "改用输出护栏",
+        "把护栏挂到 RunConfig 上即可",
+        "run_in_parallel=False，让护栏先跑完再启动模型",
+        "保持默认的 run_in_parallel=True"
+      ],
+      "answer": 2,
+      "explain": "默认并行模式只取消在途任务，拦不住已经发生的副作用；阻断模式牺牲一点延迟，换来 trip 时零模型调用。",
+      "level": "medium"
+    },
+    {
+      "q": "给退款 Agent 单独配的 input_guardrails 在被 handoff 接手后不生效，原因是？",
+      "options": [
+        "因为异常类型不是 InputGuardrailTripwireTriggered",
+        "输入护栏只作用于链条首个 Agent，中途要靠 RunConfig 全局护栏或工具护栏",
+        "因为护栏里忘了透传 context=ctx.context",
+        "因为护栏默认并行执行"
+      ],
+      "answer": 1,
+      "explain": "输入护栏只在首轮、起始 Agent 上收集执行，输出护栏也只在最终输出上跑，这是设计而非 bug。中途每次工具调用要用工具护栏。",
+      "level": "hard"
+    }
+  ],
+  "15": [
+    {
+      "q": "ToolGuardrailFunctionOutput 支持哪三种行为？",
+      "options": [
+        "allow、reject_content、raise_exception",
+        "allow、deny、replace",
+        "pass、block、retry",
+        "allow、rewrite、abort"
+      ],
+      "answer": 0,
+      "explain": "没有独立的 replace 行为：输出护栏返回 reject_content 时，工具已执行但真实结果被丢弃，模型收到的是你给的文案。",
+      "level": "easy"
+    },
+    {
+      "q": "给危险工具的参数加了默认值后，needs_approval 每次都要审批，原因是？",
+      "options": [
+        "因为回调必须是同步函数",
+        "因为工具没有挂 tool_input_guardrails",
+        "因为开启了 always_approve",
+        "参数无法被保真安全检查时回调不被调用，直接 fail-closed 要求审批"
+      ],
+      "answer": 3,
+      "explain": "参数缺失、默认值、类型转换等都会让 SDK 跳过回调直接要求人工审批。危险工具的参数尽量全部必填，把判断放进回调。",
+      "level": "medium"
+    },
+    {
+      "q": "审批通过后工具仍未执行，tool_input_guardrail_results 末条是 reject_content，原因是？",
+      "options": [
+        "因为 MCP 的 require_approval 设成了 always",
+        "因为工具是托管工具，不走 FunctionTool 管线",
+        "默认顺序是审批先于护栏，批准后输入护栏又跑一遍并拒绝了参数",
+        "输出护栏拦截了工具结果"
+      ],
+      "answer": 2,
+      "explain": "默认顺序为审批、输入护栏、执行、输出护栏；想避免无意义的审批打扰，可开 pre_approval_tool_input_guardrails。",
+      "level": "hard"
+    }
+  ],
+  "16": [
+    {
+      "q": "待审批中断发生时，result.final_output 与 result.interruptions 分别是什么？",
+      "options": [
+        "final_output 是上一轮答案，interruptions 为空列表",
+        "final_output 为 None，interruptions 是 ToolApprovalItem 列表",
+        "final_output 为空字符串，interruptions 为 None",
+        "两者都直接抛异常"
+      ],
+      "answer": 1,
+      "explain": "暂停不是失败：这一轮还没有面向用户的答案，所以 final_output 是 None；真正的产出是描述待决策调用的 interruptions。",
+      "level": "easy"
+    },
+    {
+      "q": "关于 RunState 与 Session 的分工，正确说法是？",
+      "options": [
+        "RunState 管这一次运行走到哪，Session 管这段对话说过什么",
+        "两者可以互相替代",
+        "RunState 负责持久化对话历史，Session 负责审批记录",
+        "Session 只用于服务端托管会话"
+      ],
+      "answer": 0,
+      "explain": "RunState 是一次暂停到恢复的快照，用完即弃；Session 跨多轮长期存在。恢复时要延续同一个 session 实例或同 ID 后端。",
+      "level": "medium"
+    },
+    {
+      "q": "把 state.to_json() 塞进前端隐藏字段、点击后再提交回来恢复，主要风险是？",
+      "options": [
+        "快照太大导致页面加载变慢",
+        "一定会触发 schema 版本不兼容",
+        "会导致同一轮同时使用 session 和 conversation_id",
+        "from_json 不校验来源与完整性，客户端可改工具名、参数或审批记录"
+      ],
+      "answer": 3,
+      "explain": "客户端提交什么就恢复什么，等于把执行权交给浏览器。快照应服务端独占，前端只拿不透明 ID，并对照 get_interruptions() 校验。",
+      "level": "hard"
+    }
+  ],
+  "17": [
+    {
+      "q": "Session 协议要求实现的四个方法是？",
+      "options": [
+        "read、write、append、truncate",
+        "load、save、reset、close",
+        "get_items、add_items、pop_item、clear_session",
+        "get_items、add_items、update_items、delete_session"
+      ],
+      "answer": 2,
+      "explain": "Session 是 Protocol，只要有 session_id 加这四个异步方法，结构上满足即可，不必继承 SessionABC。",
+      "level": "easy"
+    },
+    {
+      "q": "RunConfig.session_input_callback 的作用范围是？",
+      "options": [
+        "在模型调用前压缩并替换历史",
+        "只影响本轮送给模型的输入，不改变写回存储的范围",
+        "同时改写存储里的历史与本轮输入",
+        "限制每轮从存储读取多少条"
+      ],
+      "answer": 1,
+      "explain": "它拿到的是副本，返回什么模型就看到什么，但 SDK 仍只持久化本轮新增的 item。限制读取条数的是 SessionSettings.limit。",
+      "level": "medium"
+    },
+    {
+      "q": "用 SQLiteSession 文件库做多 worker 部署后偶发历史错乱，原因是？",
+      "options": [
+        "文件模式的锁只在进程内，不提供跨进程互斥，应换共享后端",
+        "因为默认 db_path 是 :memory:",
+        "因为没有设置 SessionSettings(limit)",
+        "因为四个方法没有声明 wrapper 参数"
+      ],
+      "answer": 0,
+      "explain": "同一进程内多个实例共享一把可重入锁，但跨进程无效；多 worker 应改用 Redis、SQLAlchemy 等共享存储。",
+      "level": "hard"
+    }
+  ],
+  "18": [
+    {
+      "q": "previous_response_id 策略的状态存在哪里，下一轮传什么？",
+      "options": [
+        "存在应用内存，下一轮传完整的 to_input_list",
+        "存在 Conversations API，下一轮传同一个 conversation_id",
+        "存在你的数据库，下一轮传同一个 session",
+        "存在 OpenAI Responses API，下一轮传 last_response_id 和新输入"
+      ],
+      "answer": 3,
+      "explain": "这是最轻的服务端续接，省流量省延迟，但原始历史留在服务端，无法本地全文审计，迁移成本高。",
+      "level": "easy"
+    },
+    {
+      "q": "以下哪种组合是本章明确禁止的？",
+      "options": [
+        "previous_response_id 与 auto_previous_response_id 同时使用",
+        "conversation_id 与自定义 instructions 同时使用",
+        "session 与 conversation_id 同时使用",
+        "session 与 SessionSettings(limit) 同时使用"
+      ],
+      "answer": 2,
+      "explain": "客户端托管与服务端托管互斥，session 和三种服务端参数都不能同轮出现；conversation_id 与 previous_response_id 也互斥。",
+      "level": "medium"
+    },
+    {
+      "q": "call_model_input_filter 返回了一个 list，运行时报 UserError，正确修法是？",
+      "options": [
+        "改用 session_input_callback，它才允许返回 list",
+        "返回 ModelInputData(input=..., instructions=...)",
+        "返回 None 表示不修改输入",
+        "返回一个 dict 包装这些 items"
+      ],
+      "answer": 1,
+      "explain": "0.25 对这个钩子做了显式校验，只接受 ModelInputData；它每次模型调用前都会跑，比 session_input_callback 更晚更底层。",
+      "level": "hard"
+    }
+  ],
+  "19": [
+    {
+      "q": "RunConfig.model 与 Agent.model 同时设置时，实际用哪个？",
+      "options": [
+        "RunConfig.model 优先",
+        "Agent.model 优先",
+        "两者冲突直接报错",
+        "用 provider 的默认模型"
+      ],
+      "answer": 0,
+      "explain": "get_model 的顺序是 RunConfig.model 优先于 Agent.model，所以想给单个 Agent 指定模型，就别在 RunConfig 里设 model。",
+      "level": "easy"
+    },
+    {
+      "q": "给 Agent 传 Model 实例而不是模型名字符串，意味着什么？",
+      "options": [
+        "每次调用都会重新解析模型名",
+        "能自动继承 MultiProvider 的前缀路由",
+        "该 Agent 将无法使用工具",
+        "传输方式、端点、客户端在构造时锁定，provider 与全局开关不再参与"
+      ],
+      "answer": 3,
+      "explain": "字符串是名字、实例是通道；实例会命中 get_model 的前两个分支被直接返回，路由与 WebSocket 全局设置都不再生效。",
+      "level": "medium"
+    },
+    {
+      "q": "换到只实现 Chat Completions 的兼容端点后，previous_response_id 毫无效果，怎么让不兼容暴露？",
+      "options": [
+        "把模型改成 Model 实例",
+        "加上 ModelSettings(include_usage=True)",
+        "用 OpenAIChatCompletionsModel 并开 strict_feature_validation=True",
+        "加上 auto_previous_response_id=True"
+      ],
+      "answer": 2,
+      "explain": "Chat Completions 会静默丢弃 Responses-only 字段，代码能跑但不是你以为的路径；严格校验会让它直接抛 UserError。",
+      "level": "hard"
+    }
+  ],
+  "20": [
+    {
+      "q": "output_type=list[Resume] 时，模型看到的 JSON 顶层结构是什么？",
+      "options": [
+        "列表类型不被支持，会直接报错",
+        "被包成带 `response` 键的对象",
+        "直接就是 JSON 数组",
+        "被包成带 `items` 键的对象"
+      ],
+      "answer": 1,
+      "explain": "只有 Pydantic 模型和 dict 子类不包；dataclass、TypedDict、list 等都会被包，validate_json 最后会把 response 拆掉。",
+      "level": "easy"
+    },
+    {
+      "q": "strict 模式下，为什么给字段写非 None 默认值容易踩坑？",
+      "options": [
+        "所有属性都进 required，模型必须显式给出，默认值不再可选",
+        "默认值会被 SDK 忽略",
+        "默认值会被强制变成 null",
+        "strict 不允许 Optional 字段"
+      ],
+      "answer": 0,
+      "explain": "strict 会把 properties 全部塞进 required，想表达可选只能用 Optional 让它显式输出 null。带任意键的 dict 也会在构造时就 UserError。",
+      "level": "medium"
+    },
+    {
+      "q": "开了 stop_on_first_tool 后 final_output 是工具返回的字符串，final_output_as(Resume) 失败，原因是？",
+      "options": [
+        "因为 strict 被关掉了",
+        "因为 final_output_as 默认会做 isinstance 校验",
+        "因为 handoff 换了收尾 Agent",
+        "工具直出时不过 output_type 的 schema 校验，应让工具返回 Pydantic 对象或先校验"
+      ],
+      "answer": 3,
+      "explain": "工具输出直接成为最终结果时，运行循环不会调用 validate_json；这是 output_type 最隐蔽的边界，别指望它兜住。",
+      "level": "hard"
+    }
+  ],
+  "21": [
+    {
+      "q": "关于 Runner.run_streamed()，正确说法是？",
+      "options": [
+        "它返回普通的 RunResult",
+        "它会在后台自动跑完，不需要迭代事件",
+        "立即返回句柄，执行由 stream_events() 迭代推进，不消费完不算完成",
+        "它是 async def，await 之后就能拿到完整结果"
+      ],
+      "answer": 2,
+      "explain": "它只构造结果对象并把运行循环丢进后台任务，真正的等待发生在迭代事件时；忘了迭代等于忘了运行。",
+      "level": "easy"
+    },
+    {
+      "q": "要在 UI 上提示用户 Agent 发生了交接，应处理哪些事件？",
+      "options": [
+        "raw_response_event 里的 response.completed",
+        "AgentUpdatedStreamEvent，并配合 handoff_requested",
+        "只处理 tool_called 就够了",
+        "ResponseTextDeltaEvent"
+      ],
+      "answer": 1,
+      "explain": "交接不会被报成 tool_called，只处理工具事件的 UI 会把交接静默吞掉；agent_updated_stream_event 是上下文切换的信号。",
+      "level": "medium"
+    },
+    {
+      "q": "用户点停止，但希望本轮 LLM 响应读完、待执行工具跑完、session 存好，应怎么做？",
+      "options": [
+        "调用 `cancel` 的 after_turn 模式，并继续消费事件直到结束",
+        "直接 break 循环，后台会自己停下",
+        "调用默认的 `cancel()` 就够了",
+        "先关闭 session，再退出循环"
+      ],
+      "answer": 0,
+      "explain": "after_turn 会读完本轮响应、跑完待执行工具并存好 session 再停；取消之后必须继续消费事件，否则清理会悬挂。",
+      "level": "hard"
+    }
+  ]
+}
