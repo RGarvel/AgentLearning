@@ -80,3 +80,6 @@ npm test        # 校验 33 章均可渲染、每章 3 题、搜索与自测可�
 
 1. **用户站点**：仓库命名为 `<user>.github.io`，推送 `main` 即自动发布；
 2. **项目站点**：Settings → Pages → Source 选 `Deploy from a branch`，分支 `main`、目录 `/(root)`。
+
+
+**馃敆 鍦ㄧ嚎璁块棶锛?https://rgarvel.github.io/AgentLearning/>**
