@@ -62,6 +62,10 @@ w.location.hash = "#/ch/7";
 await wait(80);
 check("chapter refs", w.document.querySelectorAll(".railrefs .ref").length > 0, String(w.document.querySelectorAll(".railrefs .ref").length));
 
+w.location.hash = "#/ch/7";
+await wait(90);
+check("inline refs", w.document.querySelectorAll("a.src-ref").length > 5, String(w.document.querySelectorAll("a.src-ref").length));
+
 check("no errors", errors.length === 0, errors.join(" | "));
 
 let failed = 0;

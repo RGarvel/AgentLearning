@@ -91,6 +91,27 @@ function extractGoals(md) {
   return block.split(/\r?\n/).filter((l) => /^\s*-\s+/.test(l))
     .map((l) => l.replace(/^\s*-\s+/, "").replace(/[\x60]/g, "").trim()).filter(Boolean);
 }
+function linkifyRefs(html) {
+  return html.replace(/<code>(repo\/[^<]+)<\/code>/g, function (whole, inner) {
+    const raw = inner.trim();
+    const trimmed = raw.replace(/[.,;:，。；：、]+$/, "");
+    let target = trimmed.replace(/^repo\//, "");
+    let wildcard = false;
+    if (target.indexOf("*") >= 0) {
+      wildcard = true;
+      target = target.slice(0, target.indexOf("*"));
+    }
+    const clean = target.replace(/\/+$/, "");
+    if (!clean || clean.indexOf("xxx") >= 0 || clean === "src/sample/simple.py") return whole;
+    const last = clean.split("/").pop() || "";
+    const FILES_NO_EXT = ["Makefile", "Dockerfile", "LICENSE", "NOTICE", "Procfile", "Gemfile"];
+    const isDir = wildcard || target.endsWith("/") || (last.indexOf(".") < 0 && FILES_NO_EXT.indexOf(last) < 0);
+    const url = "https://github.com/openai/openai-agents-python/" + (isDir ? "tree" : "blob") + "/main/" + clean;
+    const tip = "在 GitHub 查看 " + clean + (wildcard ? "/" : "");
+    return '<a class="src-ref" href="' + url + '" target="_blank" rel="noopener" title="' + tip + '"><code>' + inner + '</code><span class="sr-arrow">↗</span></a>';
+  });
+}
+
 function extractRefs(md) {
   const seen = new Map();
   for (const m of md.matchAll(/repo\/([A-Za-z0-9_\-./]+)/g)) {
@@ -135,6 +156,7 @@ for (const d of fs.readdirSync(COURSE, { withFileTypes: true })) {
     let html = marked.parse(md);
     html = html.replace(/<h1[\s\S]*?<\/h1>/, "");
     html = html.replace(/<h2 id="[^"]*">学习目标<\/h2>[\s\S]*?(?=<h2)/, "");
+    html = linkifyRefs(html);
     const title = (md.match(/^#\s+(.+)$/m) || [, f])[1].trim();
     chapters.push({
       num: Number(f.slice(0, 2)),
