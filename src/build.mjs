@@ -145,7 +145,6 @@ if (fs.existsSync(QUIZZES)) {
 }
 
 const payload = {
-  generatedAt: new Date().toISOString(),
   version: "0.25.0",
   modules: MODULES.map((m) => ({ ...m, chapters: chapters.filter((c) => c.moduleId === m.id).map((c) => c.num) })),
   chapters,
