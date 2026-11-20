@@ -91,6 +91,24 @@ function extractGoals(md) {
   return block.split(/\r?\n/).filter((l) => /^\s*-\s+/.test(l))
     .map((l) => l.replace(/^\s*-\s+/, "").replace(/[\x60]/g, "").trim()).filter(Boolean);
 }
+function extractRefs(md) {
+  const seen = new Map();
+  for (const m of md.matchAll(/repo\/([A-Za-z0-9_\-./]+)/g)) {
+    let p = m[1].replace(/[.,;:!?]+$/, "");
+    if (!p || p.includes("xxx") || p === "src/sample/simple.py") continue;
+    const isDir = p.endsWith("/");
+    const clean = isDir ? p.slice(0, -1) : p;
+    if (!clean || clean === "") continue;
+    const dir = isDir || !clean.includes(".");
+    const key = clean + (dir ? "/" : "");
+    if (seen.has(key)) continue;
+    const kind = clean.startsWith("docs/") ? "doc" : clean.startsWith("examples/") ? "example" : clean.startsWith("src/") ? "src" : "other";
+    seen.set(key, { path: key, kind, dir, url: "https://github.com/openai/openai-agents-python/" + (dir ? "tree" : "blob") + "/main/" + clean });
+  }
+  const order = { doc: 0, example: 1, src: 2, other: 3 };
+  return [...seen.values()].sort((a, b) => order[a.kind] - order[b.kind] || a.path.localeCompare(b.path));
+}
+
 function plainText(md) {
   return md
     .replace(/[\x60]{3}[\s\S]*?[\x60]{3}/g, " ")
@@ -128,6 +146,7 @@ for (const d of fs.readdirSync(COURSE, { withFileTypes: true })) {
       html,
       toc: toc.filter((t) => t.text !== "学习目标"),
       goals: extractGoals(md),
+      refs: extractRefs(md),
       text: plainText(md),
       codeBlocks: (md.match(/[\x60]{3}/g) || []).length / 2,
       minutes: Math.max(6, Math.round(plainText(md).length / 420)),

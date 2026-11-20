@@ -7,6 +7,16 @@
   var BY_NUM = {};
   CHAPTERS.forEach(function (c) { BY_NUM[c.num] = c; });
   var TOTAL = CHAPTERS.length;
+  var RESOURCES = [
+    { t: "上游仓库", d: "openai-agents-python 源码与全部文档", u: "https://github.com/openai/openai-agents-python" },
+    { t: "官方文档总览", d: "docs/index.md · 功能与选型", u: "https://github.com/openai/openai-agents-python/blob/main/docs/index.md" },
+    { t: "快速开始", d: "docs/quickstart.md", u: "https://github.com/openai/openai-agents-python/blob/main/docs/quickstart.md" },
+    { t: "可运行示例", d: "examples/ 下的完整项目", u: "https://github.com/openai/openai-agents-python/tree/main/examples" },
+    { t: "变更日志", d: "CHANGELOG.md · 版本演进", u: "https://github.com/openai/openai-agents-python/blob/main/CHANGELOG.md" },
+    { t: "Release 页面", d: "v0.25.0 发布说明", u: "https://github.com/openai/openai-agents-python/releases" },
+    { t: "MCP 规范", d: "Model Context Protocol", u: "https://modelcontextprotocol.io" },
+    { t: "Pydantic 文档", d: "工具参数与结构化输出", u: "https://docs.pydantic.dev" },
+  ];
   var KEY = "oa-course-v1";
 
   var state = load();
@@ -107,6 +117,7 @@
     var h = location.hash.replace(/^#\/?/, "");
     if (!h) return { view: "home" };
     if (h === "about") return { view: "about" };
+    if (h === "resources") return { view: "resources" };
     var m = h.match(/^ch\/(\d+)(?:~(.+))?$/);
     if (m) return { view: "chapter", num: Number(m[1]), anchor: m[2] ? decodeURIComponent(m[2]) : null };
     return { view: "home" };
@@ -119,6 +130,9 @@
       state.last = r.num;
       save();
       renderChapter(current, r.anchor);
+    } else if (r.view === "resources") {
+      current = null;
+      renderResources();
     } else if (r.view === "about") {
       current = null;
       renderAbout();
@@ -152,6 +166,7 @@
     html += '<div class="hero-actions">';
     html += '<a class="btn primary" href="#/ch/' + startChapter.num + '">' + (done ? "继续学习 · 第" + startChapter.num + "章" : "从第 0 章开始") + "</a>";
     html += '<a class="btn" href="#/ch/32">打开速查表</a>';
+    html += '<a class="btn" href="#/resources">原始资料</a>';
     html += '<button class="btn" id="helpBtn" type="button">快捷键</button>';
     html += "</div>";
 
@@ -240,6 +255,96 @@
     toast("快捷键：/ 搜索 · j 下一章 · k 上一章 · t 主题 · Esc 关闭");
   }
 
+  /* ---------------- references ---------------- */
+  var REF_LABEL = { doc: "文档", example: "示例", src: "源码", other: "其他" };
+
+  function refLink(r, wide) {
+    var cls = "ref" + (wide ? " wide" : "");
+    return '<a class="' + cls + '" href="' + esc(r.url) + '" target="_blank" rel="noopener" title="' + esc(r.path) + '">' +
+      '<span class="rk rk-' + r.kind + '">' + REF_LABEL[r.kind] + "</span>" +
+      '<span class="rp">' + esc(r.path) + "</span>" +
+      '<span class="rx">↗</span></a>';
+  }
+
+  function refsInlineHtml(c) {
+    var html = '<details class="refs-inline"><summary>本章原始资料 <span class="cnt">' + c.refs.length +
+      ' 个上游文件</span></summary><div class="reflist wide">';
+    c.refs.forEach(function (r) { html += refLink(r, true); });
+    html += '</div><a class="more" href="#/resources">查看全部原始资料 →</a></details>';
+    return html;
+  }
+
+  function refsRailHtml(c) {
+    if (!c.refs || !c.refs.length) return "";
+    var html = '<div class="railrefs"><h4>原始资料 <span>' + c.refs.length + '</span></h4><div class="reflist rail">';
+    c.refs.forEach(function (r) { html += refLink(r, false); });
+    html += '</div><a class="railmore" href="#/resources">全部资料 →</a></div>';
+    return html;
+  }
+
+  function renderResources() {
+    var totalRefs = 0, uniq = {};
+    CHAPTERS.forEach(function (c) {
+      (c.refs || []).forEach(function (r) { totalRefs++; uniq[r.path] = 1; });
+    });
+    var uniqCount = Object.keys(uniq).length;
+
+    var html = '<div class="hero small"><div class="kicker">原始资料库</div><h1>每个结论都能溯源</h1>' +
+      '<p class="lead">全书引用 <b>' + totalRefs + "</b> 处、<b>" + uniqCount +
+      "</b> 个上游文件（文档 / 示例 / 源码）。按章节列出，点击直达 GitHub 原文。</p></div>";
+
+    html += '<div class="resgrid">';
+    RESOURCES.forEach(function (g) {
+      html += '<a class="rescard" href="' + esc(g.u) + '" target="_blank" rel="noopener"><div class="rst">' +
+        esc(g.t) + '<span class="rx">↗</span></div><div class="rsd">' + esc(g.d) + "</div></a>";
+    });
+    html += "</div>";
+
+    html += '<div class="h2">按章节查看</div>';
+    html += '<div class="refbar"><input id="refFilter" class="reffilter" type="search" placeholder="过滤路径或关键词：tools / memory / guardrail …" autocomplete="off" aria-label="过滤原始资料" /><span id="refCount" class="refcount">33 章</span></div>';
+    html += '<div id="refIndex" class="refindex">';
+
+    DATA.modules.forEach(function (m) {
+      if (!m.chapters.length) return;
+      html += '<div class="refmod"><div class="refmodt">' + esc(m.title) + "</div>";
+      m.chapters.forEach(function (n) {
+        var c = BY_NUM[n];
+        var refs = c.refs || [];
+        var paths = refs.map(function (r) { return r.path.toLowerCase(); }).join(" ");
+        html += '<details class="refch" data-paths="' + esc(paths) + '"><summary><span class="rn">第' + n +
+          '章</span><span class="rt">' + esc(c.title) + '</span><span class="rc">' + refs.length + "</span></summary><div class=\"reflist wide\">";
+        refs.forEach(function (r) { html += refLink(r, true); });
+        html += "</div></details>";
+      });
+      html += "</div>";
+    });
+    html += "</div>";
+
+    $("#view").innerHTML = html;
+    $("#toc").innerHTML = "";
+    $("#chapterNav").hidden = true;
+    window.scrollTo({ top: 0 });
+    setReadbar(0);
+
+    var input = $("#refFilter");
+    var countEl = $("#refCount");
+    input.addEventListener("input", function () {
+      var q = input.value.trim().toLowerCase();
+      var shown = 0;
+      $$(".refch").forEach(function (d) {
+        var hit = !q || (d.getAttribute("data-paths") || "").indexOf(q) >= 0;
+        d.style.display = hit ? "" : "none";
+        if (hit) shown++;
+        if (q) d.open = hit;
+      });
+      $$(".refmod").forEach(function (m) {
+        var any = $$(".refch", m).some(function (d) { return d.style.display !== "none"; });
+        m.style.display = any ? "" : "none";
+      });
+      countEl.textContent = q ? shown + " / 33 章" : "33 章";
+    });
+  }
+
   /* ---------------- about ---------------- */
   function renderAbout() {
     var done = doneCount();
@@ -318,6 +423,8 @@
 
     if (qs.length) html += quizPlaceholder(c.num, qs.length);
 
+    if (c.refs && c.refs.length) html += refsInlineHtml(c);
+
     html += '<details class="notes"><summary>我的笔记（自动保存，仅存本地）<span class="saved" id="noteSaved"></span></summary>' +
       '<textarea id="noteArea" placeholder="记下这一章对你最有用的三句话……"></textarea></details>';
 
@@ -326,7 +433,7 @@
     view.innerHTML = html;
     $("#chapterNav").hidden = false;
     renderChapterNav(c);
-    $("#toc").innerHTML = tocHtml(c);
+    $("#toc").innerHTML = tocHtml(c) + refsRailHtml(c);
     renderQuiz(c.num, qs);
     bindChapter(c, goals, qs);
     setReadbar(0);

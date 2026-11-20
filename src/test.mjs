@@ -54,6 +54,14 @@ s.dispatchEvent(new w.Event("input", { bubbles: true }));
 await wait(220);
 check("search", !$("#searchResults").hidden && $$("#searchResults .sr-item").length > 0);
 
+w.location.hash = "#/resources";
+await wait(120);
+check("resources page", w.document.querySelectorAll(".rescard").length === 8, String(w.document.querySelectorAll(".rescard").length));
+check("ref index 33", w.document.querySelectorAll(".refch").length === 33, String(w.document.querySelectorAll(".refch").length));
+w.location.hash = "#/ch/7";
+await wait(80);
+check("chapter refs", w.document.querySelectorAll(".railrefs .ref").length > 0, String(w.document.querySelectorAll(".railrefs .ref").length));
+
 check("no errors", errors.length === 0, errors.join(" | "));
 
 let failed = 0;
