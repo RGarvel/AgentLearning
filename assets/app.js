@@ -241,7 +241,8 @@
     html += '<div class="doors">';
     html += doorCard("#/learn", "01 · 精读", "主线 11 章", "循环会不会停、上下文边界在哪、危险操作在哪断、出事靠什么查。每章一个验收点。", coreDone + " / " + CORE_ORDER.length + " 已完成");
     html += doorCard("#/manual", "02 · 查", "手册 12 章", "参数、机制、配置。让 agent 写，你只核对签名与边界；卡住了按关键词搜。", "不当书读");
-    html += doorCard("#/review", "03 · 审", "评审 30 项", "阻断级 18 项 + 建议 12 项，配 10 个真实事故。可以导出成 Markdown 贴进 PR。", checkDone + " / " + checkTotal + " 已勾选");
+    var blk = allChecks().filter(function (it) { return it.sev === "blocker"; }).length;
+    html += doorCard("#/review", "03 · 审", "评审 " + checkTotal + " 项", "阻断级 " + blk + " 项 + 建议 " + (checkTotal - blk) + " 项，配 10 个真实事故。可以导出成 Markdown 贴进 PR。", checkDone + " / " + checkTotal + " 已勾选");
     html += "</div>";
 
     html += '<div class="why"><div class="why-t">为什么这样排</div>' +
