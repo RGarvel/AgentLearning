@@ -91,7 +91,9 @@
       m.chapters.forEach(function (n) {
         var c = BY_NUM[n];
         var cls = "nav-ch" + (state.completed[n] ? " done" : "") + (current && current.num === n ? " active" : "");
-        html += '<a class="' + cls + '" href="#/ch/' + n + '" data-num="' + n + '"><span class="n">' + String(n) +
+        var tier = tierOf(n);
+        var dot = tier === "core" ? '<i class="dot core"></i>' : (tier === "ref" ? '<i class="dot ref"></i>' : "");
+        html += '<a class="' + cls + '" href="#/ch/' + n + '" data-num="' + n + '"><span class="n">' + dot + String(n) +
           '</span><span class="t">' + esc(c.title) + "</span></a>";
       });
       html += "</div>";
@@ -118,6 +120,7 @@
     if (!h) return { view: "home" };
     if (h === "about") return { view: "about" };
     if (h === "resources") return { view: "resources" };
+    if (h === "all") return { view: "all" };
     var m = h.match(/^ch\/(\d+)(?:~(.+))?$/);
     if (m) return { view: "chapter", num: Number(m[1]), anchor: m[2] ? decodeURIComponent(m[2]) : null };
     return { view: "home" };
@@ -130,6 +133,9 @@
       state.last = r.num;
       save();
       renderChapter(current, r.anchor);
+    } else if (r.view === "all") {
+      current = null;
+      renderAll();
     } else if (r.view === "resources") {
       current = null;
       renderResources();
@@ -146,40 +152,114 @@
   }
 
   /* ---------------- home ---------------- */
+  /* 章节定位：core=必读判断力，prereq=前置，ref=速查，optional=按需，later=后置 */
+  var TIERS = {
+    "0": ["prereq", "10 分钟：知道这门课怎么用就行"],
+    "1": ["prereq", "建立“Agent=模型+指令+工具+循环”的心智模型"],
+    "2": ["prereq", "跑通环境；版本与依赖的坑都在这里"],
+    "3": ["prereq", "看懂 Agent 的字段，才能看懂第 4 章"],
+    "4": ["core", "循环没有终止条件，就会“能跑但烧钱”"],
+    "5": ["core", "不会看 items，就不知道它第 7 轮为什么跑偏"],
+    "6": ["core", "context 划错边界，系统就没法测、没法多租户"],
+    "7": ["ref", "让 agent 写，你只核对签名与错误回填"],
+    "8": ["ref", "托管工具的能力边界与计费，用时查"],
+    "9": ["ref", "MCP 的传输、生命周期与审批，用时查"],
+    "10": ["ref", "作 manager 编排时的参数表"],
+    "11": ["ref", "判断该用 handoff 还是 as_tool"],
+    "12": ["ref", "交接过滤与历史裁剪，改路由时查"],
+    "13": ["optional", "要让 agent 真改仓库/跑命令时再读"],
+    "14": ["core", "护栏要在哪一层断、断完怎么回话"],
+    "15": ["core", "危险工具必须先过审批，agent 不会替你想"],
+    "16": ["core", "断点放哪、恢复时状态怎么对齐，只能人设计"],
+    "17": ["ref", "会话实现细节，接存储时查"],
+    "18": ["ref", "跨轮状态策略选型，架构评审时用"],
+    "19": ["ref", "换模型/换供应商时查"],
+    "20": ["ref", "结构化输出的 strict 限制，用时查"],
+    "21": ["ref", "做流式 UI 时查事件类型"],
+    "22": ["core", "review agent 写的 agent，trace 是唯一抓手"],
+    "23": ["core", "没有回归，改一句 prompt 都是掷骰子"],
+    "24": ["core", "报错速查与最小复现，决定排障速度"],
+    "25": ["optional", "做语音产品再读"],
+    "26": ["optional", "做实时语音对话再读"],
+    "27": ["optional", "要改 SDK 或判断“这是不是 bug”时读"],
+    "28": ["optional", "要逐行理解运行循环时读"],
+    "29": ["optional", "要做生产级重试与兜底时读"],
+    "30": ["later", "等你要落地完整系统时，让 agent 生成更贴合"],
+    "31": ["later", "同上；评估闭环可以后补"],
+    "32": ["ref", "参数速查表，贴在手边"],
+  };
+  var TIER_LABEL = { core: "必读", prereq: "前置", ref: "速查", optional: "按需", later: "后置" };
+  var CORE_ORDER = [2, 3, 4, 5, 6, 14, 15, 16, 22, 23, 24];
+  function tierOf(n) { return (TIERS[String(n)] || ["ref", ""])[0]; }
+  function whyOf(n) { return (TIERS[String(n)] || ["ref", ""])[1]; }
+
+  function pathCard(n) {
+    var c = BY_NUM[n];
+    var done = !!state.completed[n];
+    var tier = tierOf(n);
+    return '<a class="pathcard' + (done ? " done" : "") + '" href="#/ch/' + n + '">' +
+      '<span class="pc-n">' + String(n).padStart(2, "0") + "</span>" +
+      '<span class="pc-main"><span class="pc-t">' + esc(c.title) + "</span>" +
+      '<span class="pc-w">' + esc(whyOf(n)) + "</span></span>" +
+      '<span class="pc-m">' + c.minutes + ' 分</span>' +
+      '<span class="tier t-' + tier + '">' + TIER_LABEL[tier] + "</span></a>";
+  }
+
   function renderHome() {
     var done = doneCount();
-    var pct = Math.round((done / TOTAL) * 100);
-    var quizKeys = Object.keys(state.quiz);
-    var qTotal = 0, qCorrect = 0;
-    quizKeys.forEach(function (k) { qTotal += state.quiz[k].total || 0; qCorrect += state.quiz[k].best || 0; });
-    var acc = qTotal ? Math.round((qCorrect / qTotal) * 100) : 0;
-    var notes = Object.keys(state.notes).filter(function (k) { return (state.notes[k] || "").trim().length; }).length;
-    var minutes = CHAPTERS.reduce(function (a, c) { return a + c.minutes; }, 0);
-    var startNum = state.last && BY_NUM[state.last] && !state.completed[state.last] ? state.last : firstIncomplete();
+    var coreDone = CORE_ORDER.filter(function (n) { return state.completed[n]; }).length;
+    var coreMin = CORE_ORDER.reduce(function (a, n) { return a + BY_NUM[n].minutes; }, 0);
+    var startNum = firstIncompleteIn(CORE_ORDER.concat([0, 1]));
     var startChapter = BY_NUM[startNum] || CHAPTERS[0];
 
     var html = '<div class="hero">';
-    html += '<div class="kicker">openai-agents-python · v' + esc(DATA.version) + '</div>';
-    html += '<h1>把 Agent 这台机器<br/>拆开、装上、再跑起来</h1>';
-    html += '<p class="lead">33 章交互式课程：读一节、勾一个目标、做三道自测题，进度与笔记自动保存。' +
-      '内容全部基于仓库源码与官方文档，每一章都能落到可运行的代码。</p>';
+    html += '<div class="kicker">openai-agents-python · v' + esc(DATA.version) + " · 33 章</div>";
+    html += "<h1>先读 11 章，<br/>够用 90%</h1>";
+    html += '<p class="lead">33 章里真正决定成败的，不是"会调 API"，而是<strong>能不能审住 agent 写出来的东西</strong>：' +
+      "终止条件、上下文边界、审批断点、排错抓手。其余章节按需速查即可。</p>";
     html += '<div class="hero-actions">';
-    html += '<a class="btn primary" href="#/ch/' + startChapter.num + '">' + (done ? "继续学习 · 第" + startChapter.num + "章" : "从第 0 章开始") + "</a>";
-    html += '<a class="btn" href="#/ch/32">打开速查表</a>';
+    html += '<a class="btn primary" href="#/ch/' + startChapter.num + '">' + (coreDone ? "继续必读路径 · 第" + startChapter.num + "章" : "从第 2 章开始（前置 2 章 + 必读 9 章）") + "</a>";
+    html += '<a class="btn" href="#/all">浏览全部 33 章</a>';
     html += '<a class="btn" href="#/resources">原始资料</a>';
-    html += '<button class="btn" id="helpBtn" type="button">快捷键</button>';
     html += "</div>";
 
-    html += '<div class="stats">';
-    html += '<div class="stat"><div class="k">完成章节</div><div class="v">' + done + '<small> / ' + TOTAL + "</small></div></div>";
-    html += '<div class="stat"><div class="k">自测正确率</div><div class="v">' + acc + "<small>%</small></div></div>";
-    html += '<div class="stat"><div class="k">已记笔记</div><div class="v">' + notes + "<small> 章</small></div></div>";
-    html += '<div class="stat"><div class="k">全课程时长</div><div class="v">' + Math.round(minutes / 60) + "<small> 小时</small></div></div>";
-    html += "</div>";
-    html += '<div class="progressbig"><i style="width:' + pct + '%"></i></div>';
-    html += '<div class="note">整体进度 ' + pct + "%，读完后建议直接做第 30、31 章的实战。</div>";
+    html += '<div class="pathbar"><div class="pb-top"><span>必读路径进度</span><span class="pb-num">' + coreDone + " / " + CORE_ORDER.length + "</span></div>" +
+      '<div class="progressbig"><i style="width:' + Math.round((coreDone / CORE_ORDER.length) * 100) + '%"></i></div>' +
+      '<div class="note">路径总时长约 ' + Math.round(coreMin / 60) + " 小时；剩下 " + (TOTAL - done) + " 章未完成（全课程）。</div></div>";
 
-    html += '<div class="h2">模块</div><div class="modgrid">';
+    html += '<div class="decider" id="decider">' +
+      '<div class="d-title">先判断你该读到哪一层</div>' +
+      '<div class="d-q" data-q="1"><span>你负责把 Agent 代码上线吗？</span>' +
+      '<button data-v="y" type="button">负责</button><button data-v="n" type="button">不负责</button></div>' +
+      '<div class="d-q" data-q="2"><span>只做"单 Agent + 少量工具"的轻场景？</span>' +
+      '<button data-v="y" type="button">是</button><button data-v="n" type="button">不是</button></div>' +
+      '<div class="d-q" data-q="3"><span>遇到 SDK 行为异常，团队里有人读源码吗？</span>' +
+      '<button data-v="y" type="button">有</button><button data-v="n" type="button">没有</button></div>' +
+      '<div class="d-result" id="dResult">选完三项，给出你的最短路径。</div>' +
+      "</div>";
+
+    html += '<div class="h2">必读路径 <span class="h2sub">前置 2 + 判断力 9</span></div>';
+    html += '<div class="pathlist">';
+    CORE_ORDER.forEach(function (n) { html += pathCard(n); });
+    html += "</div>";
+
+    html += '<div class="h2">速查 <span class="h2sub">让 agent 写，你核签名</span></div>';
+    html += '<div class="chiprow">';
+    [7, 8, 9, 10, 11, 12, 17, 18, 19, 20, 21, 32].forEach(function (n) {
+      html += '<a class="chapchip" href="#/ch/' + n + '"><span>' + n + " " + esc(BY_NUM[n].title) + "</span><em>" + esc(whyOf(n)) + "</em></a>";
+    });
+    html += "</div>";
+
+    html += '<div class="h2">按需 / 后置</div>';
+    html += '<div class="chiprow small">';
+    [13, 25, 26, 27, 28, 29, 30, 31].forEach(function (n) {
+      var t = tierOf(n);
+      html += '<a class="chapchip ' + t + '" href="#/ch/' + n + '"><span>' + n + " " + esc(BY_NUM[n].title) + '</span><em>' + TIER_LABEL[t] + " · " + esc(whyOf(n)) + "</em></a>";
+    });
+    html += "</div>";
+
+    html += '<div class="h2">全部章节</div>';
+    html += '<div class="modgrid">';
     DATA.modules.forEach(function (m) {
       if (!m.chapters.length) return;
       var d = m.chapters.filter(function (n) { return state.completed[n]; }).length;
@@ -192,34 +272,70 @@
     });
     html += "</div>";
 
-    html += '<div class="h2">三条路线</div><div class="routes">';
-    html += '<div class="route"><h4>3 天速通</h4><p>第 2 → 3 → 4 → 7 → 12 → 17 → 22 → 30 章，先拿到能跑的骨架。</p><a href="#/ch/2">从第 2 章开始 →</a></div>';
-    html += '<div class="route"><h4>2 周系统</h4><p>按模块 0-7 顺序推进，模块 10 收尾，每章配一次动手练习。</p><a href="#/ch/0">从第 0 章开始 →</a></div>';
-    html += '<div class="route"><h4>源码深潜</h4><p>第 26 → 27 → 28 → 29 章，回读核心运行时，专治疑难杂症。</p><a href="#/ch/26">从第 26 章开始 →</a></div>';
-    html += "</div>";
-
     html += '<div class="tools" style="margin-top:26px">';
     html += '<button class="btn" id="exportBtn" type="button">导出学习记录</button>';
     html += '<button class="btn" id="resetBtn" type="button">重置进度</button>';
+    html += '<button class="btn" id="helpBtn" type="button">快捷键</button>';
     html += "</div>";
     html += '<div class="note">数据只保存在这台机器的浏览器里（localStorage），不会上传。</div>';
     html += "</div>";
 
-    var view = $("#view");
-    view.innerHTML = html;
+    $("#view").innerHTML = html;
     $("#toc").innerHTML = "";
     $("#chapterNav").hidden = true;
     window.scrollTo({ top: 0 });
     setReadbar(0);
 
-    $("#helpBtn").addEventListener("click", showHelp);
     $("#exportBtn").addEventListener("click", exportProgress);
+    $("#helpBtn").addEventListener("click", showHelp);
     $("#resetBtn").addEventListener("click", function () {
       if (!confirm("确定要清空完成进度、自测成绩与笔记吗？此操作不可撤销。")) return;
       state = { completed: {}, quiz: {}, goals: {}, notes: {}, theme: state.theme, last: null };
       save();
       onRoute();
       toast("已重置");
+    });
+    bindDecider();
+  }
+
+  function firstIncompleteIn(list) {
+    for (var i = 0; i < list.length; i++) if (!state.completed[list[i]]) return list[i];
+    return list[0];
+  }
+
+  function bindDecider() {
+    var answers = {};
+    var result = $("#dResult");
+    var labels = {
+      1: { y: "负责上线", n: "不负责上线" },
+      2: { y: "单 Agent 轻场景", n: "多 Agent / 复杂流程" },
+      3: { y: "有人读源码", n: "没人读源码" },
+    };
+    function decide() {
+      if (Object.keys(answers).length < 3) return;
+      var text;
+      if (answers[1] === "n") {
+        text = "结论：别系统学。把课程当故障手册——先扫第 0–2 章，之后踩坑再按章查。你的收益不在“读懂”，而在“查得到”。";
+      } else if (answers[2] === "y") {
+        text = "结论：走必读路径 11 章（前置 2 章 + 判断力 9 章），速查表贴手边。项目章 30–31 等有真实需求再读，别为了“学完”而读。";
+      } else {
+        text = "结论：必读 11 章之外，加读第 11、12、18 章（编排与状态策略），因为多 Agent 的失败模式只能靠设计兜住。";
+      }
+      if (answers[1] === "y" && answers[3] === "n") {
+        text += " 另外：团队没人读源码，就把第 27–29 章当作“判断 bug 还是用错”的保险，至少通读一遍。";
+      }
+      result.textContent = text;
+      result.classList.add("on");
+    }
+    $$("#decider .d-q").forEach(function (row) {
+      row.querySelectorAll("button").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          row.querySelectorAll("button").forEach(function (b) { b.classList.remove("on"); });
+          btn.classList.add("on");
+          answers[Number(row.getAttribute("data-q"))] = btn.getAttribute("data-v");
+          decide();
+        });
+      });
     });
   }
 
@@ -253,6 +369,34 @@
 
   function showHelp() {
     toast("快捷键：/ 搜索 · j 下一章 · k 上一章 · t 主题 · Esc 关闭");
+  }
+
+  /* ---------------- all chapters ---------------- */
+  function renderAll() {
+    var html = '<div class="hero small"><div class="kicker">全部章节</div><h1>33 章，按模块</h1>' +
+      '<p class="lead">带 <span class="tier t-core">必读</span> 标记的是判断力章节；其余按需查阅。也可以用顶部搜索直接找概念。</p>' +
+      '<div class="hero-actions"><a class="btn primary" href="#/">回到学习路径</a><a class="btn" href="#/resources">原始资料</a></div></div>';
+
+    DATA.modules.forEach(function (m) {
+      if (!m.chapters.length) return;
+      html += '<div class="allmod"><div class="refmodt">' + esc(m.title) + '</div>';
+      m.chapters.forEach(function (n) {
+        var c = BY_NUM[n];
+        var t = tierOf(n);
+        html += '<a class="allrow' + (state.completed[n] ? " done" : "") + '" href="#/ch/' + n + '">' +
+          '<span class="ar-n">' + String(n).padStart(2, "0") + "</span>" +
+          '<span class="ar-t">' + esc(c.title) + "</span>" +
+          '<span class="ar-w">' + esc(whyOf(n)) + "</span>" +
+          '<span class="tier t-' + t + '">' + TIER_LABEL[t] + "</span></a>";
+      });
+      html += "</div>";
+    });
+
+    $("#view").innerHTML = html;
+    $("#toc").innerHTML = "";
+    $("#chapterNav").hidden = true;
+    window.scrollTo({ top: 0 });
+    setReadbar(0);
   }
 
   /* ---------------- references ---------------- */
@@ -360,6 +504,7 @@
     html += '</ul>';
     html += '<div class="h2">怎么用这套课</div>';
     html += '<ul class="prose" style="padding-left:22px">';
+    html += '<li>不想通读也没关系：首页给了「前置 2 + 必读 9」的最短路径，其余章节按需速查。</li>';
     html += '<li>每章先读正文，勾掉"学习目标"，再做 3 道自测；错题解析就在选项下方。</li>';
     html += '<li>代码块右上角可一键复制；所有示例对应教材第 2 章配置好的本地仓库。</li>';
     html += '<li>进度与笔记只存浏览器本地，可用首页按钮导出成 Markdown。</li>';
@@ -401,7 +546,10 @@
     html += '<span class="chip">约 ' + c.minutes + " 分钟</span>";
     html += '<span class="chip">' + c.codeBlocks + " 个代码块</span>";
     if (qs.length) html += '<span class="chip">自测 ' + qs.length + " 题</span>";
-    html += "</div></div>";
+    html += "</div>";
+    var tierNow = tierOf(c.num);
+    html += '<div class="chpos"><span class="tier t-' + tierNow + '">' + TIER_LABEL[tierNow] + "</span><span>" + esc(whyOf(c.num)) + "</span></div>";
+    html += "</div>";
 
     if (goals.length) {
       html += '<div class="goals"><h3>学习目标</h3><div class="hint">读完一条就勾一条，勾选会保存。</div>';
