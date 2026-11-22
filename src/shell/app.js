@@ -23,7 +23,7 @@
   var searchIndex = null;
 
   function load() {
-    var base = { completed: {}, quiz: {}, goals: {}, notes: {}, theme: null, last: null };
+    var base = { completed: {}, quiz: {}, goals: {}, notes: {}, checks: {}, theme: null, last: null };
     try {
       var raw = localStorage.getItem(KEY);
       if (!raw) return base;
@@ -83,17 +83,15 @@
   function renderNav() {
     var nav = $("#nav");
     var html = "";
-    DATA.modules.forEach(function (m) {
-      if (!m.chapters.length) return;
-      var done = m.chapters.filter(function (n) { return state.completed[n]; }).length;
-      html += '<div class="nav-mod"><div class="nav-modtitle"><span>' + esc(m.title) +
-        '</span><span class="nav-modprog">' + done + "/" + m.chapters.length + "</span></div>";
-      m.chapters.forEach(function (n) {
+    ROLE_GROUPS.forEach(function (g) {
+      if (!g.chapters.length) return;
+      var done = g.chapters.filter(function (n) { return state.completed[n]; }).length;
+      html += '<div class="nav-mod"><div class="nav-modtitle"><span>' + esc(g.title) +
+        '</span><span class="nav-modprog">' + done + "/" + g.chapters.length + "</span></div>";
+      g.chapters.forEach(function (n) {
         var c = BY_NUM[n];
         var cls = "nav-ch" + (state.completed[n] ? " done" : "") + (current && current.num === n ? " active" : "");
-        var tier = tierOf(n);
-        var dot = tier === "core" ? '<i class="dot core"></i>' : (tier === "ref" ? '<i class="dot ref"></i>' : "");
-        html += '<a class="' + cls + '" href="#/ch/' + n + '" data-num="' + n + '"><span class="n">' + dot + String(n) +
+        html += '<a class="' + cls + '" href="#/ch/' + n + '" data-num="' + n + '"><span class="n">' + String(n) +
           '</span><span class="t">' + esc(c.title) + "</span></a>";
       });
       html += "</div>";
@@ -121,6 +119,9 @@
     if (h === "about") return { view: "about" };
     if (h === "resources") return { view: "resources" };
     if (h === "all") return { view: "all" };
+    if (h === "learn") return { view: "learn" };
+    if (h === "manual") return { view: "manual" };
+    if (h === "review") return { view: "review" };
     var m = h.match(/^ch\/(\d+)(?:~(.+))?$/);
     if (m) return { view: "chapter", num: Number(m[1]), anchor: m[2] ? decodeURIComponent(m[2]) : null };
     return { view: "home" };
@@ -133,6 +134,15 @@
       state.last = r.num;
       save();
       renderChapter(current, r.anchor);
+    } else if (r.view === "learn") {
+      current = null;
+      renderLearn();
+    } else if (r.view === "manual") {
+      current = null;
+      renderManual();
+    } else if (r.view === "review") {
+      current = null;
+      renderReview();
     } else if (r.view === "all") {
       current = null;
       renderAll();
@@ -205,80 +215,54 @@
       '<span class="tier t-' + tier + '">' + TIER_LABEL[tier] + "</span></a>";
   }
 
+  function doorCard(href, kicker, title, desc, meta) {
+    return '<a class="door" href="' + href + '"><div class="d-k">' + esc(kicker) + '</div><div class="d-t">' + esc(title) +
+      '</div><div class="d-d">' + esc(desc) + '</div><div class="d-m">' + esc(meta) + "</div></a>";
+  }
+
   function renderHome() {
     var done = doneCount();
     var coreDone = CORE_ORDER.filter(function (n) { return state.completed[n]; }).length;
-    var coreMin = CORE_ORDER.reduce(function (a, n) { return a + BY_NUM[n].minutes; }, 0);
-    var startNum = firstIncompleteIn(CORE_ORDER.concat([0, 1]));
-    var startChapter = BY_NUM[startNum] || CHAPTERS[0];
+    var next = firstIncompleteIn(CORE_ORDER);
+    var checkTotal = allChecks().length;
+    var checkDone = checkedCount();
 
     var html = '<div class="hero">';
-    html += '<div class="kicker">openai-agents-python · v' + esc(DATA.version) + " · 33 章</div>";
-    html += "<h1>先读 11 章，<br/>够用 90%</h1>";
-    html += '<p class="lead">33 章里真正决定成败的，不是"会调 API"，而是<strong>能不能审住 agent 写出来的东西</strong>：' +
-      "终止条件、上下文边界、审批断点、排错抓手。其余章节按需速查即可。</p>";
+    html += '<div class="kicker">openai-agents-python · v' + esc(DATA.version) + " · 33 章重组为三种用法</div>";
+    html += "<h1>能审住 agent 写的代码，<br/>比会写它更值钱</h1>";
+    html += '<p class="lead">模型几秒就能生成带 handoff 和 guardrail 的代码，但它不承担上线后的失败。' +
+      "这门课按“拿来干什么”重新切成三块：<strong>精读判断力、查手册、过评审</strong>。</p>";
     html += '<div class="hero-actions">';
-    html += '<a class="btn primary" href="#/ch/' + startChapter.num + '">' + (coreDone ? "继续必读路径 · 第" + startChapter.num + "章" : "从第 2 章开始（前置 2 章 + 必读 9 章）") + "</a>";
-    html += '<a class="btn" href="#/all">浏览全部 33 章</a>';
+    html += '<a class="btn primary" href="#/learn">' + (coreDone ? "继续主线 · " + coreDone + "/" + CORE_ORDER.length : "开始 11 章主线") + "</a>";
+    html += '<a class="btn" href="#/review">评审清单（' + checkTotal + ' 项）</a>';
+    html += '<a class="btn" href="#/manual">手册</a>';
+    html += "</div></div>";
+
+    html += '<div class="doors">';
+    html += doorCard("#/learn", "01 · 精读", "主线 11 章", "循环会不会停、上下文边界在哪、危险操作在哪断、出事靠什么查。每章一个验收点。", coreDone + " / " + CORE_ORDER.length + " 已完成");
+    html += doorCard("#/manual", "02 · 查", "手册 12 章", "参数、机制、配置。让 agent 写，你只核对签名与边界；卡住了按关键词搜。", "不当书读");
+    html += doorCard("#/review", "03 · 审", "评审 30 项", "阻断级 18 项 + 建议 12 项，配 10 个真实事故。可以导出成 Markdown 贴进 PR。", checkDone + " / " + checkTotal + " 已勾选");
+    html += "</div>";
+
+    html += '<div class="why"><div class="why-t">为什么这样排</div>' +
+      '<div class="why-i"><b>1</b>API 记忆会折旧：能查就别背，手册只保留“用完即查”的索引。</div>' +
+      '<div class="why-i"><b>2</b>责任不会折旧：终止条件、审批断点、trace 抓手是模型不替你承担的。</div>' +
+      '<div class="why-i"><b>3</b>版本会骗人：0.25 的新参数（如 handoff 的 failure_error_function）模型常常写成旧版，主线里保留了“版本真相”。</div></div>';
+
+    html += '<div class="decider" id="decider"><div class="d-title">先判断你该读到哪一层</div>' +
+      '<div class="d-q" data-q="1"><span>你负责把 Agent 代码上线吗？</span><button data-v="y" type="button">负责</button><button data-v="n" type="button">不负责</button></div>' +
+      '<div class="d-q" data-q="2"><span>只做“单 Agent + 少量工具”的轻场景？</span><button data-v="y" type="button">是</button><button data-v="n" type="button">不是</button></div>' +
+      '<div class="d-q" data-q="3"><span>遇到 SDK 行为异常，团队里有人读源码吗？</span><button data-v="y" type="button">有</button><button data-v="n" type="button">没有</button></div>' +
+      '<div class="d-result" id="dResult">选完三项，给出你的最短路径。</div></div>';
+
+    html += '<div class="tools" style="margin-top:8px">';
+    html += '<a class="btn" href="#/all">全部 33 章</a>';
     html += '<a class="btn" href="#/resources">原始资料</a>';
-    html += "</div>";
-
-    html += '<div class="pathbar"><div class="pb-top"><span>必读路径进度</span><span class="pb-num">' + coreDone + " / " + CORE_ORDER.length + "</span></div>" +
-      '<div class="progressbig"><i style="width:' + Math.round((coreDone / CORE_ORDER.length) * 100) + '%"></i></div>' +
-      '<div class="note">路径总时长约 ' + Math.round(coreMin / 60) + " 小时；剩下 " + (TOTAL - done) + " 章未完成（全课程）。</div></div>";
-
-    html += '<div class="decider" id="decider">' +
-      '<div class="d-title">先判断你该读到哪一层</div>' +
-      '<div class="d-q" data-q="1"><span>你负责把 Agent 代码上线吗？</span>' +
-      '<button data-v="y" type="button">负责</button><button data-v="n" type="button">不负责</button></div>' +
-      '<div class="d-q" data-q="2"><span>只做"单 Agent + 少量工具"的轻场景？</span>' +
-      '<button data-v="y" type="button">是</button><button data-v="n" type="button">不是</button></div>' +
-      '<div class="d-q" data-q="3"><span>遇到 SDK 行为异常，团队里有人读源码吗？</span>' +
-      '<button data-v="y" type="button">有</button><button data-v="n" type="button">没有</button></div>' +
-      '<div class="d-result" id="dResult">选完三项，给出你的最短路径。</div>' +
-      "</div>";
-
-    html += '<div class="h2">必读路径 <span class="h2sub">前置 2 + 判断力 9</span></div>';
-    html += '<div class="pathlist">';
-    CORE_ORDER.forEach(function (n) { html += pathCard(n); });
-    html += "</div>";
-
-    html += '<div class="h2">速查 <span class="h2sub">让 agent 写，你核签名</span></div>';
-    html += '<div class="chiprow">';
-    [7, 8, 9, 10, 11, 12, 17, 18, 19, 20, 21, 32].forEach(function (n) {
-      html += '<a class="chapchip" href="#/ch/' + n + '"><span>' + n + " " + esc(BY_NUM[n].title) + "</span><em>" + esc(whyOf(n)) + "</em></a>";
-    });
-    html += "</div>";
-
-    html += '<div class="h2">按需 / 后置</div>';
-    html += '<div class="chiprow small">';
-    [13, 25, 26, 27, 28, 29, 30, 31].forEach(function (n) {
-      var t = tierOf(n);
-      html += '<a class="chapchip ' + t + '" href="#/ch/' + n + '"><span>' + n + " " + esc(BY_NUM[n].title) + '</span><em>' + TIER_LABEL[t] + " · " + esc(whyOf(n)) + "</em></a>";
-    });
-    html += "</div>";
-
-    html += '<div class="h2">全部章节</div>';
-    html += '<div class="modgrid">';
-    DATA.modules.forEach(function (m) {
-      if (!m.chapters.length) return;
-      var d = m.chapters.filter(function (n) { return state.completed[n]; }).length;
-      var p = Math.round((d / m.chapters.length) * 100);
-      html += '<a class="modcard" href="#/ch/' + m.chapters[0] + '">';
-      html += '<div class="mt"><span>' + esc(m.title) + '</span><span class="chip">' + d + "/" + m.chapters.length + "</span></div>";
-      html += '<div class="ms">' + esc(m.sub) + "</div>";
-      html += '<div class="mp"><i style="width:' + p + '%"></i></div>';
-      html += '<div class="mv">' + p + "% 完成</div></a>";
-    });
-    html += "</div>";
-
-    html += '<div class="tools" style="margin-top:26px">';
     html += '<button class="btn" id="exportBtn" type="button">导出学习记录</button>';
     html += '<button class="btn" id="resetBtn" type="button">重置进度</button>';
     html += '<button class="btn" id="helpBtn" type="button">快捷键</button>';
     html += "</div>";
     html += '<div class="note">数据只保存在这台机器的浏览器里（localStorage），不会上传。</div>';
-    html += "</div>";
 
     $("#view").innerHTML = html;
     $("#toc").innerHTML = "";
@@ -289,8 +273,8 @@
     $("#exportBtn").addEventListener("click", exportProgress);
     $("#helpBtn").addEventListener("click", showHelp);
     $("#resetBtn").addEventListener("click", function () {
-      if (!confirm("确定要清空完成进度、自测成绩与笔记吗？此操作不可撤销。")) return;
-      state = { completed: {}, quiz: {}, goals: {}, notes: {}, theme: state.theme, last: null };
+      if (!confirm("确定要清空完成进度、自测成绩、笔记与评审勾选吗？此操作不可撤销。")) return;
+      state = { completed: {}, quiz: {}, goals: {}, notes: {}, checks: {}, theme: state.theme, last: null };
       save();
       onRoute();
       toast("已重置");
@@ -371,6 +355,73 @@
     toast("快捷键：/ 搜索 · j 下一章 · k 上一章 · t 主题 · Esc 关闭");
   }
 
+  /* ================= course structure & review kit ================= */
+  var ROLE_GROUPS = [
+    { id: "main", title: "主线 · 判断力", sub: "精读，决定你能不能审住 agent 的产出", chapters: [2, 3, 4, 5, 6, 14, 15, 16, 22, 23, 24] },
+    { id: "manual", title: "手册 · 用时查", sub: "参数与机制速查，不按顺序读", chapters: [7, 8, 9, 10, 11, 12, 17, 18, 19, 20, 21, 32] },
+    { id: "asneeded", title: "按需 · 做才读", sub: "语音、沙箱、源码深潜", chapters: [13, 25, 26, 27, 28, 29] },
+    { id: "later", title: "后置 · 有项目再读", sub: "实战与评估闭环，agent 能生成更贴合的版本", chapters: [30, 31] },
+    { id: "intro", title: "导入", sub: "十分钟知道这门课怎么用", chapters: [0, 1] },
+  ];
+
+  var CHECKLIST = [
+    { cat: "终止与预算", items: [
+      { id: "t1", sev: "blocker", t: "每次 Runner.run 都显式传了 max_turns", why: "默认 10 轮并不意味着安全，模型反复调工具时会一路烧到上限。", ch: [4] },
+      { id: "t2", sev: "blocker", t: "工具调用有超时（@tool(timeout=...) 或外层超时）", why: "一个卡死的工具会让整个 run 挂住，前面的预算控制全部失效。", ch: [7, 29] },
+      { id: "t3", sev: "should", t: "有 token / 费用上限或熔断，而不只是事后看账单", why: "Usage 能统计，但没人会在事故发生时盯它；需要有自动止损。", ch: [19, 22] },
+      { id: "t4", sev: "should", t: "循环有“进展信号”，不是换皮死循环", why: "每轮必须产生新信息（新工具结果、新状态），否则就是在重复同一轮。", ch: [4, 5] },
+      { id: "t5", sev: "blocker", t: "重试是 opt-in，且只用于幂等请求", why: "0.25 的通用模型重试默认关闭；盲目打开会让有副作用的请求重放。", ch: [29] },
+    ]},
+    { cat: "上下文与状态", items: [
+      { id: "c1", sev: "blocker", t: "本地 context 与对话历史分开：依赖走 RunContextWrapper.context", why: "业务对象塞进 prompt 会污染模型输入，也让多轮历史失控。", ch: [6] },
+      { id: "c2", sev: "blocker", t: "context 里没有密钥 / PII，或已确认 trace 不落敏感字段", why: "trace 默认记录工具入参与输出，敏感数据会一起进后端。", ch: [6, 22] },
+      { id: "c3", sev: "blocker", t: "多用户场景 session_id 按用户隔离", why: "复用 session_id 等于让 A 读到 B 的历史，这是最典型的越权。", ch: [17] },
+      { id: "c4", sev: "should", t: "RunState 快照留在服务端，不交给前端回传", why: "from_json 不校验来源，客户端可以改工具名、参数、审批记录。", ch: [16] },
+      { id: "c5", sev: "should", t: "长对话有裁剪 / 压缩策略", why: "无限增长的历史最终会撞上窗口上限，或让成本线性上涨。", ch: [17, 18] },
+    ]},
+    { cat: "工具与副作用", items: [
+      { id: "k1", sev: "blocker", t: "破坏性工具（退款/删除/发信）要求 needs_approval 或工具护栏", why: "模型天生乐观，不会主动为不可逆操作加闸门。", ch: [15] },
+      { id: "k2", sev: "blocker", t: "工具失败策略是明确的：话术回填还是抛异常", why: "默认 failure_error_function 会把异常变成一句文案，模型可能顺势编造成功。", ch: [7, 15] },
+      { id: "k3", sev: "should", t: "写操作有幂等键，重试与审批重放不会重复执行", why: "恢复、重试、审批三条路径都可能让同一个调用执行两次。", ch: [16, 30] },
+      { id: "k4", sev: "should", t: "MCP server 用最小权限凭据，敏感工具配了 require_approval", why: "远端 server 拿到什么凭据，就等于模型能做什么。", ch: [9] },
+      { id: "k5", sev: "should", t: "工具返回内容不会被当成指令直接执行", why: "网页、文档、第三方 API 的返回都可能夹带注入。", ch: [14] },
+    ]},
+    { cat: "护栏与人审", items: [
+      { id: "g1", sev: "blocker", t: "输入护栏与输出护栏至少各有一条", why: "护栏不是过滤器，是断路器：它要在越界时中断，而不是劝说模型。", ch: [14] },
+      { id: "g2", sev: "blocker", t: "tripwire 触发被捕获，并有用户可读的话术", why: "不捕获就是 500，用户只看到服务挂了。", ch: [14] },
+      { id: "g3", sev: "should", t: "输出护栏覆盖“工具直出即最终输出”的路径", why: "tool_use_behavior 让工具结果绕过模型时，输出护栏仍是最后一道闸。", ch: [14, 10] },
+      { id: "g4", sev: "blocker", t: "审批断点在工具执行前，拒绝后模型能继续而不是重试同一操作", why: "错误的断点位置会把“拒绝”变成“再来一次”。", ch: [15, 16] },
+      { id: "g5", sev: "should", t: "审批决策有审计记录（谁、何时、对哪个 call_id）", why: "出事后只有审批记录能还原“谁放行了这一步”。", ch: [16] },
+    ]},
+    { cat: "可观测与回归", items: [
+      { id: "o1", sev: "blocker", t: "tracing 默认开启，且生产有可查询的导出后端", why: "review agent 写的 agent，trace 是唯一抓手。", ch: [22] },
+      { id: "o2", sev: "should", t: "业务主键进了 trace_metadata（订单号 / trace_id）", why: "没有业务键，线上一次失败对不上任何一条记录。", ch: [22] },
+      { id: "o3", sev: "blocker", t: "有确定性测试（ScriptedModel）覆盖工具与护栏路径", why: "真模型不可复现，回归必须跑在替身上。", ch: [23] },
+      { id: "o4", sev: "should", t: "有固定问题集的评估，改 prompt 前后能对比", why: "否则每次改动都是掷骰子，只是骰子变贵了。", ch: [23, 31] },
+      { id: "o5", sev: "should", t: "日志里带 run_id / trace_id，能和代码里的调用对上", why: "排障的第一步是把日志和一次具体运行对齐。", ch: [24] },
+    ]},
+    { cat: "交付与演进", items: [
+      { id: "d1", sev: "blocker", t: "模型与 SDK 版本被固定，升级有回归路径", why: "0.25 这类快速迭代的库，模型和 SDK 都会悄悄改变行为。", ch: [2, 19] },
+      { id: "d2", sev: "should", t: "全局错误处理覆盖 max_turns / refusal / invalid output", why: "这三类失败不是异常，是运行结束状态，容易漏掉。", ch: [4, 29] },
+      { id: "d3", sev: "should", t: "提示词与工具描述进版本库，改动可评审", why: "prompt 就是代码，不进库等于线上不可回滚。", ch: [23] },
+      { id: "d4", sev: "should", t: "有降级方案：模型不可用或超时时返回什么", why: "没有降级，模型抖动就直接变成用户可见故障。", ch: [29] },
+      { id: "d5", sev: "should", t: "有升级预案：先做契约 diff 再升级", why: "released_api_contract.json 能告诉你公开 API 到底变没变。", ch: [2, 19] },
+    ]},
+  ];
+
+  var FAILURES = [
+    { t: "循环停不下来，账单暴涨", s: "单次请求跑了几十轮，工具被反复调用", c: "没设 max_turns，或 tool_choice 被强制要求调用", f: "显式 max_turns + 进展信号 + 成本熔断", ch: 4 },
+    { t: "工具报错，模型却说“已成功”", s: "外部 API 500，回复却是“退款已办理”", c: "默认 failure_error_function 把异常换成了一句模糊文案", f: "明确失败策略：关键路径传 None 抛异常，其余自定义话术", ch: 7 },
+    { t: "第二轮上下文翻倍", s: "每轮 token 数翻倍增长", c: "同时用 session 和 result.to_input_list() 喂历史", f: "二选一：要么 SDK 管历史，要么手管，别叠加", ch: 18 },
+    { t: "用户 A 看到用户 B 的历史", s: "换账号后出现别人的对话", c: "session_id 写死或复用了全局值", f: "session_id 按租户/用户隔离，服务端鉴权后再取", ch: 17 },
+    { t: "审批通过后重复退款", s: "同一笔退款执行了两次", c: "恢复执行时没有幂等键，重放了工具调用", f: "写操作带幂等键，审批记录与执行结果绑定", ch: 16 },
+    { t: "线上偶发失败无法复现", s: "用户投诉答非所问，日志里只有一句 MaxTurnsExceeded", c: "tracing 被关或敏感数据被裁剪到无法还原", f: "打开 tracing，敏感字段做脱敏但不丢结构", ch: 22 },
+    { t: "护栏拦住了，但接口 500", s: "内容被拦截时前端只看到服务异常", c: "没有捕获 tripwire 异常", f: "捕获 InputGuardrailTripwireTriggered / OutputGuardrailTripwireTriggered 并回话术", ch: 14 },
+    { t: "交接后风格突变、上下文丢失", s: "转到专家 agent 后忘了前面说过什么", c: "handoff input_filter 把关键历史过滤掉了", f: "检查 input_filter 与嵌套历史设置", ch: 12 },
+    { t: "换模型后工具不调用", s: "同一个 agent 换供应商后不再调用工具", c: "Chat Completions 通道对 strict schema / 工具选择支持不同", f: "核对通道能力，必要时 strict_feature_validation", ch: 19 },
+    { t: "MCP 工具调错", s: "两个 server 有同名工具，总是命中错的那个", c: "没开 include_server_in_tool_names，工具名冲突", f: "开启服务名前缀，或改工具命名策略", ch: 9 },
+  ];
+
   /* ---------------- all chapters ---------------- */
   function renderAll() {
     var html = '<div class="hero small"><div class="kicker">全部章节</div><h1>33 章，按模块</h1>' +
@@ -397,6 +448,168 @@
     $("#chapterNav").hidden = true;
     window.scrollTo({ top: 0 });
     setReadbar(0);
+  }
+
+  /* ---------------- learn / manual / review ---------------- */
+  function allChecks() {
+    var out = [];
+    CHECKLIST.forEach(function (g) { g.items.forEach(function (it) { out.push(it); }); });
+    return out;
+  }
+  function checkedCount() {
+    return allChecks().filter(function (it) { return state.checks && state.checks[it.id]; }).length;
+  }
+
+  function renderLearn() {
+    var groups = [
+      { t: "前置：先能跑、先看懂", nums: [2, 3] },
+      { t: "第一关：循环与上下文", nums: [4, 5, 6], note: "读完你能回答：这个循环会不会停？上下文边界在哪？" },
+      { t: "第二关：防线", nums: [14, 15, 16], note: "读完你能回答：危险操作在哪断？拒绝之后怎么恢复？" },
+      { t: "第三关：抓手", nums: [22, 23, 24], note: "读完你能回答：线上出事，我靠什么定位、靠什么回归？" },
+    ];
+    var done = CORE_ORDER.filter(function (n) { return state.completed[n]; }).length;
+    var mins = CORE_ORDER.reduce(function (a, n) { return a + BY_NUM[n].minutes; }, 0);
+    var next = firstIncompleteIn(CORE_ORDER);
+    var html = '<div class="hero small"><div class="kicker">主线 · 判断力</div><h1>11 章，把“审”的能力建起来</h1>' +
+      '<p class="lead">这 11 章不是 API 教学，是 review 训练：每章结尾都有一个“你能判断什么”的验收点。其余章节进手册，用时再查。</p>' +
+      '<div class="hero-actions"><a class="btn primary" href="#/ch/' + next + '">' + (done ? "继续 · 第" + next + "章" : "从第 2 章开始") + "</a>" +
+      '<a class="btn" href="#/review">去评审清单</a><a class="btn" href="#/manual">打开手册</a></div>' +
+      '<div class="pathbar"><div class="pb-top"><span>主线进度</span><span class="pb-num">' + done + " / " + CORE_ORDER.length + "</span></div>" +
+      '<div class="progressbig"><i style="width:' + Math.round((done / CORE_ORDER.length) * 100) + '%"></i></div>' +
+      '<div class="note">总时长约 ' + Math.round(mins / 60) + " 小时。读完主线，再按项目需要去手册里查具体 API。</div></div></div>";
+
+    groups.forEach(function (g) {
+      html += '<div class="learnpart"><div class="lp-t">' + esc(g.t) + "</div>";
+      if (g.note) html += '<div class="lp-n">' + esc(g.note) + "</div>";
+      g.nums.forEach(function (n) { html += pathCard(n); });
+      html += "</div>";
+    });
+
+    html += '<div class="learnfoot"><a class="btn primary" href="#/review">下一步：用评审清单过一遍你手上的代码</a>' +
+      '<a class="btn" href="#/manual">需要查 API 时打开手册</a></div>';
+
+    $("#view").innerHTML = html;
+    $("#toc").innerHTML = "";
+    $("#chapterNav").hidden = true;
+    window.scrollTo({ top: 0 });
+    setReadbar(0);
+  }
+
+  function renderManual() {
+    var nums = ROLE_GROUPS.filter(function (g) { return g.id === "manual"; })[0].chapters;
+    var html = '<div class="hero small"><div class="kicker">手册 · 用时查</div><h1>12 章，不当书读</h1>' +
+      '<p class="lead">这些是参数、机制与配置。让 agent 写，你只核对签名和边界；卡住了按关键词搜。</p>' +
+      '<div class="hero-actions"><a class="btn primary" href="#/review">评审清单</a><a class="btn" href="#/all">全部 33 章</a></div></div>';
+    html += '<div class="refbar"><input id="manFilter" class="reffilter" type="search" placeholder="查：handoff / MCP / 流式 / 结构化输出 / session …" autocomplete="off" /></div>';
+    html += '<div id="manList" class="mangrid">';
+    nums.forEach(function (n) {
+      var c = BY_NUM[n];
+      html += '<a class="mancard" data-k="' + esc((c.title + " " + whyOf(n)).toLowerCase()) + '" href="#/ch/' + n + '">' +
+        '<div class="mn">' + n + '</div><div class="mm"><div class="mt2">' + esc(c.title) + '</div>' +
+        '<div class="mw">' + esc(whyOf(n)) + '</div></div><div class="mk">' + c.minutes + " 分</div></a>";
+    });
+    html += "</div>";
+
+    $("#view").innerHTML = html;
+    $("#toc").innerHTML = "";
+    $("#chapterNav").hidden = true;
+    window.scrollTo({ top: 0 });
+    setReadbar(0);
+
+    var input = $("#manFilter");
+    input.addEventListener("input", function () {
+      var q = input.value.trim().toLowerCase();
+      $$(".mancard").forEach(function (card) {
+        card.style.display = !q || (card.getAttribute("data-k") || "").indexOf(q) >= 0 ? "" : "none";
+      });
+    });
+  }
+
+  function renderReview() {
+    var totals = allChecks().length;
+    var checkedNow = checkedCount();
+    var blockers = allChecks().filter(function (it) { return it.sev === "blocker"; }).length;
+    var html = '<div class="hero small"><div class="kicker">评审 · 上线前</div><h1>审 agent 写的代码，而不是重写它</h1>' +
+      '<p class="lead">' + totals + " 项检查（" + blockers + " 项阻断级），来自课程里最常出事的地方。勾选状态存在本地，可导出成 Markdown 贴进 PR。</p></div>";
+
+    html += '<div class="pathbar"><div class="pb-top"><span>检查进度</span><span class="pb-num">' + checkedNow + " / " + totals + "</span></div>" +
+      '<div class="progressbig"><i style="width:' + Math.round((checkedNow / totals) * 100) + '%"></i></div>' +
+      '<div class="note">阻断项未过，不建议上线；should 项按风险接受度处理。</div></div>';
+
+    html += '<div class="tools" style="margin:0 0 18px"><button class="btn" id="exportChecks" type="button">导出检查结果</button>' +
+      '<button class="btn" id="clearChecks" type="button">清空勾选</button></div>';
+
+    CHECKLIST.forEach(function (g, gi) {
+      html += '<div class="ckgroup"><div class="ck-t">' + esc(g.cat) + "</div>";
+      g.items.forEach(function (it) {
+        var on = !!(state.checks && state.checks[it.id]);
+        html += '<label class="ck' + (on ? " on" : "") + '" data-id="' + it.id + '">' +
+          '<input type="checkbox" data-check="' + it.id + '"' + (on ? " checked" : "") + " />" +
+          '<span class="ck-body"><span class="ck-line"><span class="sev ' + it.sev + '">' + (it.sev === "blocker" ? "阻断" : "建议") + "</span>" + esc(it.t) + "</span>" +
+          '<span class="ck-why">' + esc(it.why) + "</span>" +
+          '<span class="ck-ch">' + it.ch.map(function (n) { return '<a href="#/ch/' + n + '">第' + n + "章</a>"; }).join(" · ") + "</span></span></label>";
+      });
+      html += "</div>";
+    });
+
+    html += '<div class="h2">常见事故 <span class="h2sub">症状 → 根因 → 修法</span></div>';
+    html += '<div class="failgrid">';
+    FAILURES.forEach(function (f) {
+      html += '<div class="fail"><div class="f-t">' + esc(f.t) + '</div>' +
+        '<div class="f-r"><b>症状</b>' + esc(f.s) + "</div>" +
+        '<div class="f-r"><b>根因</b>' + esc(f.c) + "</div>" +
+        '<div class="f-r fix"><b>修法</b>' + esc(f.f) + "</div>" +
+        '<a class="f-ch" href="#/ch/' + f.ch + '">第' + f.ch + "章 →</a></div>";
+    });
+    html += "</div>";
+
+    $("#view").innerHTML = html;
+    $("#toc").innerHTML = "";
+    $("#chapterNav").hidden = true;
+    window.scrollTo({ top: 0 });
+    setReadbar(0);
+
+    $$("input[data-check]").forEach(function (box) {
+      box.addEventListener("change", function () {
+        var id = box.getAttribute("data-check");
+        state.checks = state.checks || {};
+        if (box.checked) state.checks[id] = true; else delete state.checks[id];
+        save();
+        box.closest(".ck").classList.toggle("on", box.checked);
+        var c = checkedCount();
+        $("#progressPill").textContent = doneCount() + " / " + TOTAL;
+        var bar = $(".pathbar .progressbig i");
+        if (bar) bar.style.width = Math.round((c / totals) * 100) + "%";
+        var num = $(".pathbar .pb-num");
+        if (num) num.textContent = c + " / " + totals;
+      });
+    });
+
+    $("#exportChecks").addEventListener("click", function () {
+      var lines = ["# Agent 上线前评审清单", "", "导出时间：" + new Date().toLocaleString(), ""];
+      CHECKLIST.forEach(function (g) {
+        lines.push("## " + g.cat);
+        g.items.forEach(function (it) {
+          var on = !!(state.checks && state.checks[it.id]);
+          lines.push("- [" + (on ? "x" : " ") + "] " + (it.sev === "blocker" ? "[阻断] " : "[建议] ") + it.t);
+        });
+        lines.push("");
+      });
+      var blob = new Blob([lines.join("\n")], { type: "text/markdown;charset=utf-8" });
+      var a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "agent-review-checklist.md";
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000);
+      toast("已导出检查结果");
+    });
+    $("#clearChecks").addEventListener("click", function () {
+      if (!confirm("清空全部勾选？")) return;
+      state.checks = {};
+      save();
+      renderReview();
+      toast("已清空");
+    });
   }
 
   /* ---------------- references ---------------- */
