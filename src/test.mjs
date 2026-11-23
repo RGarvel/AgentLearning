@@ -15,6 +15,13 @@ const dom = new JSDOM(read("index.html"), { runScripts: "outside-only", url: "ht
 const w = dom.window;
 w.scrollTo = () => {};
 w.HTMLElement.prototype.scrollIntoView = () => {};
+w.fetch = (url) => new Promise((resolve, reject) => {
+  const rel = String(url).replace(/^\/+/, "");
+  fs.readFile(path.join(ROOT, rel), "utf8", (err, txt) => {
+    if (err) return reject(new Error("HTTP 404 " + rel));
+    resolve({ ok: true, status: 200, json: () => Promise.resolve(JSON.parse(txt)) });
+  });
+});
 w.eval(read("assets/course-data.js"));
 w.eval(read("assets/app.js"));
 
@@ -51,8 +58,8 @@ check("quiz feedback", $$("#quizBody .explain").length === 1);
 const s = $("#search");
 s.value = "handoff";
 s.dispatchEvent(new w.Event("input", { bubbles: true }));
-await wait(220);
-check("search", !$("#searchResults").hidden && $$("#searchResults .sr-item").length > 0);
+await wait(400);
+check("search", !$("#searchResults").hidden && $$("#searchResults .sr-item").length > 0, String($$("#searchResults .sr-item").length));
 
 w.location.hash = "#/resources";
 await wait(120);

@@ -3,10 +3,35 @@
 
   var DATA = window.COURSE;
   var CHAPTERS = DATA.chapters;
-  var QUIZZES = DATA.quizzes || {};
   var BY_NUM = {};
   CHAPTERS.forEach(function (c) { BY_NUM[c.num] = c; });
   var TOTAL = CHAPTERS.length;
+
+  /* 按章懒加载：index 只带元信息，正文 / TOC / 目标 / 自测按章取 */
+  var CH_CACHE = {};
+  var CH_PENDING = {};
+  function chapterUrl(num) { return "assets/data/ch/" + (num < 10 ? "0" + num : String(num)) + ".json"; }
+  function fetchJSON(url) {
+    return fetch(url).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status + " " + url);
+      return r.json();
+    });
+  }
+  function loadChapter(num) {
+    if (CH_CACHE[num]) return Promise.resolve(CH_CACHE[num]);
+    if (CH_PENDING[num]) return CH_PENDING[num];
+    var p = fetchJSON(chapterUrl(num)).then(function (d) {
+      var full = Object.assign({}, BY_NUM[num], d);
+      CH_CACHE[num] = full;
+      delete CH_PENDING[num];
+      return full;
+    }, function (e) {
+      delete CH_PENDING[num];
+      throw e;
+    });
+    CH_PENDING[num] = p;
+    return p;
+  }
   var RESOURCES = [
     { t: "上游仓库", d: "openai-agents-python 源码与全部文档", u: "https://github.com/openai/openai-agents-python" },
     { t: "官方文档总览", d: "docs/index.md · 功能与选型", u: "https://github.com/openai/openai-agents-python/blob/main/docs/index.md" },
@@ -127,13 +152,27 @@
     return { view: "home" };
   }
 
+  var routeToken = 0;
   function onRoute() {
     var r = parseHash();
+    var token = ++routeToken;
     if (r.view === "chapter" && BY_NUM[r.num]) {
-      current = BY_NUM[r.num];
-      state.last = r.num;
+      var num = r.num;
+      current = BY_NUM[num];
+      state.last = num;
       save();
-      renderChapter(current, r.anchor);
+      if (CH_CACHE[num]) {
+        renderChapter(CH_CACHE[num], r.anchor);
+      } else {
+        renderChapterLoading(num);
+        loadChapter(num).then(function (full) {
+          if (token !== routeToken) return;
+          renderChapter(full, r.anchor);
+        }, function (e) {
+          if (token !== routeToken) return;
+          renderChapterError(num, e);
+        });
+      }
     } else if (r.view === "learn") {
       current = null;
       renderLearn();
@@ -747,10 +786,44 @@
   /* ---------------- chapter ---------------- */
   function stripFirstH1(html) { return html.replace(/^\s*<h1[\s\S]*?<\/h1>/, ""); }
 
+  function chapterShellHtml(c, extra) {
+    var html = '<div class="article"><div class="ch-head">';
+    html += '<div class="crumbs"><a href="#/">课程首页</a> / ' + esc(c.moduleTitle) + "</div>";
+    html += '<h1 class="ch-title">第' + c.num + "章 " + esc(c.title) + "</h1>";
+    html += '<div class="ch-meta"><span class="chip accent">' + esc(c.moduleTitle) + "</span>";
+    html += '<span class="chip">约 ' + c.minutes + " 分钟</span>";
+    html += '<span class="chip">' + c.codeBlocks + " 个代码块</span></div></div>" + extra + "</div>";
+    return html;
+  }
+
+  function renderChapterLoading(num) {
+    var c = BY_NUM[num];
+    $("#view").innerHTML = chapterShellHtml(c, '<div class="note">正在加载正文…</div>');
+    $("#toc").innerHTML = "";
+    $("#chapterNav").hidden = true;
+    window.scrollTo({ top: 0 });
+    setReadbar(0);
+  }
+
+  function renderChapterError(num, e) {
+    var c = BY_NUM[num];
+    $("#view").innerHTML = chapterShellHtml(c,
+      '<div class="note">正文加载失败：' + esc((e && e.message) || "网络异常") +
+      '。 <button class="btn" id="retryCh" type="button">重试</button></div>');
+    $("#toc").innerHTML = "";
+    $("#chapterNav").hidden = true;
+    var btn = $("#retryCh");
+    if (btn) btn.addEventListener("click", function () {
+      delete CH_PENDING[num];
+      delete CH_CACHE[num];
+      onRoute();
+    });
+  }
+
   function renderChapter(c, anchor) {
     var view = $("#view");
     var goals = c.goals || [];
-    var qs = QUIZZES[String(c.num)] || [];
+    var qs = c.quiz || [];
     var done = !!state.completed[c.num];
 
     var html = '<div class="article"><div class="ch-head">';
@@ -982,20 +1055,40 @@
   }, { passive: true });
 
   /* ---------------- search ---------------- */
-  function buildIndex() {
-    if (searchIndex) return searchIndex;
-    searchIndex = CHAPTERS.map(function (c) {
-      return { num: c.num, title: c.title, module: c.moduleTitle, text: c.text, lower: (c.title + " " + c.text).toLowerCase() };
+  var corpusPending = null;
+  function loadCorpus() {
+    if (corpusPending) return corpusPending;
+    corpusPending = fetchJSON("assets/data/search.json").then(function (rows) {
+      var map = {};
+      rows.forEach(function (r) { map[r.n] = r.t; });
+      searchIndex = CHAPTERS.map(function (c) {
+        var text = map[c.num] || "";
+        return { num: c.num, title: c.title, module: c.moduleTitle, text: text, lower: (c.title + " " + text).toLowerCase() };
+      });
+      return searchIndex;
+    }, function (e) {
+      corpusPending = null;
+      throw e;
     });
-    return searchIndex;
+    return corpusPending;
   }
 
   function doSearch(q) {
     q = q.trim().toLowerCase();
     var box = $("#searchResults");
     if (!q) { box.hidden = true; box.innerHTML = ""; return; }
-    var idx = buildIndex();
+    if (!searchIndex) {
+      box.innerHTML = '<div class="sr-empty">正在准备搜索索引…</div>';
+      box.hidden = false;
+      loadCorpus().then(function () {
+        if (searchInput.value.trim().toLowerCase() === q) doSearch(q);
+      }, function () {
+        box.innerHTML = '<div class="sr-empty">搜索索引加载失败，请检查网络后重试。</div>';
+      });
+      return;
+    }
     var hits = [];
+    var idx = searchIndex;
     idx.forEach(function (c) {
       var pos = c.lower.indexOf(q);
       if (pos < 0) return;
@@ -1023,7 +1116,10 @@
 
   var searchInput = $("#search");
   searchInput.addEventListener("input", debounce(function () { doSearch(searchInput.value); }, 90));
-  searchInput.addEventListener("focus", function () { if (searchInput.value) doSearch(searchInput.value); });
+  searchInput.addEventListener("focus", function () {
+    loadCorpus().catch(function () {});
+    if (searchInput.value) doSearch(searchInput.value);
+  });
   searchInput.addEventListener("keydown", function (e) {
     if (e.key === "Escape") { searchInput.value = ""; $("#searchResults").hidden = true; searchInput.blur(); }
     if (e.key === "Enter") {
