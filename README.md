@@ -44,7 +44,7 @@
 
 ## 本地运行
 
-站点是纯静态的，直接打开 `index.html` 即可（无需服务器、无网络请求）。想用 HTTP 预览：
+站点是纯静态的，但因为正文按章懒加载（`fetch`），**必须通过 HTTP 打开**，直接双击 `index.html` 会被浏览器的同源策略拦住。
 
 ```bash
 python -m http.server 4173
@@ -56,18 +56,38 @@ python -m http.server 4173
 ```text
 .
 ├── index.html              # 站点入口（构建产物，已提交，Pages 直接可用）
-├── assets/                 # 构建产物：course-data.js / app.css / app.js / hljs.css
+├── assets/
+│   ├── course-data.js      # 构建产物：课程索引（模块 / 章节元信息 / 引用），首屏唯一数据文件
+│   ├── data/
+│   │   ├── ch/00.json…32.json   # 单章正文 + 目录 + 学习目标 + 自测，按需拉取
+│   │   └── search.json     # 全文搜索语料，首次搜索时才加载
+│   ├── app.css
+│   ├── app.js
+│   └── hljs.css
 ├── content/                # 课程正文（Markdown，构建输入）
 │   ├── 00-导论/
 │   ├── 01-核心运行时/
 │   └── … 共 11 个模块
 ├── src/
-│   ├── build.mjs           # Markdown → HTML → assets/course-data.js
+│   ├── build.mjs           # Markdown → HTML → 索引 + 按章 JSON
 │   ├── test.mjs            # jsdom 冒烟测试（33 章渲染 + 交互）
 │   ├── shell/              # 页面骨架、样式、前端逻辑
 │   └── quizzes/            # 99 道自测题（q1/q2/q3.json）
 └── package.json
 ```
+
+## 加载策略
+
+首屏只取索引（约 56 KB），正文与搜索语料按需加载，避免一次性下载整本书：
+
+| 资源 | 体积 | 何时加载 |
+| --- | --- | --- |
+| `course-data.js` | 56 KB | 首屏 |
+| `data/ch/NN.json` | 平均 37 KB | 进入该章时（已访问过的缓存在内存，返回即秒开） |
+| `data/search.json` | 360 KB | 搜索框获得焦点或首次输入时 |
+
+首屏从 1.6 MB 降到约 190 KB（gzip 44 KB）。
+
 
 ## 修改与重建
 
@@ -93,4 +113,4 @@ npm test        # 校验 33 章均可渲染、每章 3 题、搜索与自测可�
 2. **项目站点**：Settings → Pages → Source 选 `Deploy from a branch`，分支 `main`、目录 `/(root)`。
 
 
-**馃敆 鍦ㄧ嚎璁块棶锛?https://rgarvel.github.io/AgentLearning/>**
+**在线访问：https://rgarvel.github.io/AgentLearning/**

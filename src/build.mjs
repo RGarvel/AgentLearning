@@ -185,18 +185,53 @@ if (fs.existsSync(QUIZZES)) {
   }
 }
 
-const payload = {
+const modules = MODULES.map((m) => ({ ...m, chapters: chapters.filter((c) => c.moduleId === m.id).map((c) => c.num) }));
+
+const index = {
   version: "0.25.0",
-  modules: MODULES.map((m) => ({ ...m, chapters: chapters.filter((c) => c.moduleId === m.id).map((c) => c.num) })),
-  chapters,
-  quizzes,
+  modules,
+  chapters: chapters.map((c) => ({
+    num: c.num,
+    moduleId: c.moduleId,
+    moduleTitle: c.moduleTitle,
+    title: c.title,
+    fullTitle: c.fullTitle,
+    file: c.file,
+    minutes: c.minutes,
+    codeBlocks: c.codeBlocks,
+    refs: c.refs,
+  })),
 };
 
 fs.mkdirSync(path.join(OUT, "assets"), { recursive: true });
-fs.writeFileSync(path.join(OUT, "assets", "course-data.js"), "window.COURSE=" + JSON.stringify(payload) + ";", "utf8");
+fs.writeFileSync(path.join(OUT, "assets", "course-data.js"), "window.COURSE=" + JSON.stringify(index) + ";", "utf8");
+
+const DATA = path.join(OUT, "assets", "data");
+const CH_DIR = path.join(DATA, "ch");
+fs.rmSync(DATA, { recursive: true, force: true });
+fs.mkdirSync(CH_DIR, { recursive: true });
+
+const pad = (n) => String(n).padStart(2, "0");
+for (const c of chapters) {
+  const body = { num: c.num, html: c.html, toc: c.toc, goals: c.goals, quiz: quizzes[String(c.num)] || [] };
+  fs.writeFileSync(path.join(CH_DIR, pad(c.num) + ".json"), JSON.stringify(body), "utf8");
+}
+
+const corpus = chapters.map((c) => ({ n: c.num, t: c.text }));
+fs.writeFileSync(path.join(DATA, "search.json"), JSON.stringify(corpus), "utf8");
 for (const f of ["index.html"]) fs.copyFileSync(path.join(SHELL, f), path.join(OUT, f));
 for (const f of ["app.css", "app.js"]) fs.copyFileSync(path.join(SHELL, f), path.join(OUT, "assets", f));
 const hljsCss = path.join(ROOT, "node_modules", "highlight.js", "styles", "github-dark-dimmed.min.css");
 if (fs.existsSync(hljsCss)) fs.copyFileSync(hljsCss, path.join(OUT, "assets", "hljs.css"));
 
-console.log("chapters:", chapters.length, "| quizzes:", Object.keys(quizzes).length);
+const kb = (p) => (fs.statSync(p).size / 1024).toFixed(1) + " KB";
+const chFiles = fs.readdirSync(CH_DIR);
+let chTotal = 0;
+for (const f of chFiles) chTotal += fs.statSync(path.join(CH_DIR, f)).size;
+console.log(
+  "chapters:", chapters.length,
+  "| quizzes:", Object.keys(quizzes).length,
+  "| 首屏 course-data.js:", kb(path.join(OUT, "assets", "course-data.js")),
+  "| 单章平均:", (chTotal / chFiles.length / 1024).toFixed(1) + " KB",
+  "| 搜索语料:", kb(path.join(DATA, "search.json"))
+);
