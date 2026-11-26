@@ -1,8 +1,10 @@
 # 第25章 语音流水线 VoicePipeline
 
-第 24 章我们把 Agent 的运行过程"看见"了：trace、items、日志。这一章换个方向——把 Agent 搬到电话线上。语音不是新的一套运行时，它只是包在 Runner 外面的一层适配器；理解这一点，你就不会把"语音 Agent"当成一门新学问。
+第 24 章我们把 Agent 的运行过程"看见"了：trace、items、日志。这一章换个方向，把 Agent 搬到电话线上。
 
-本章解决的真实问题：**用户对着麦克风说话，怎么变成 Agent 能处理的文本，再把 Agent 的回答变回声音，并且中途不卡顿、能被打断、能测试。**
+语音不是新的一套运行时。它只是包在 Runner 外面的一层适配器。想通这一点，"语音 Agent"就不再是一门新学问。
+
+本章解决的真实问题：**用户对着麦克风说话，怎么变成 Agent 能处理的文本，再把 Agent 的回答变回声音，并且中途不卡顿、能被打断、能测试。**读完你会清楚每一段归谁负责、失败从哪冒出来，以及怎么在没有麦克风的机器上跑测试。
 
 ---
 
@@ -18,13 +20,15 @@
 
 ## 一、三段式：语音只是一层适配器
 
-`VoicePipeline` 的 docstring 把设计意图写得很直白（`repo/src/agents/voice/pipeline.py`）：
+**语音流水线（voice pipeline）从头到尾只有三段：转写、workflow、合成。**
+
+`VoicePipeline` 的 docstring 把设计意图写得很直白，见 `repo/src/agents/voice/pipeline.py`。它只做三件事：
 
 1. 把音频输入转成文本（speech-to-text）；
 2. 运行你给的 workflow，它产出一串文本；
 3. 把这些文本流转成流式音频输出（text-to-speech）。
 
-关键在于第 2 步：**"你的代码"在中间，SDK 不关心你里面是不是 Agent**。你可以是一个 Agent、三个 Agent 轮流上、纯规则逻辑，甚至直接 yield 一句硬编码的话。语音层只认一个接口：
+关键在于第 2 步：**"你的代码"在中间，SDK 不关心你里面是不是 Agent**。你可以是一个 Agent，也可以是三个 Agent 轮流上、纯规则逻辑，甚至直接 yield 一句硬编码的话。语音层只认一个接口：
 
 ```python
 class VoiceWorkflowBase(abc.ABC):
@@ -34,7 +38,11 @@ class VoiceWorkflowBase(abc.ABC):
     async def on_start(self) -> AsyncIterator[str]: ...  # 可选，用于开场白
 ```
 
-注意这里的类型标注是 `-> AsyncIterator[str]`，而基类用的是普通 `def`。实现时两种写法都合法：**普通 `def` + `yield`**（生成器函数）或 **`async def` + `yield`**（异步生成器函数，仓库里的 `examples/voice/streamed/my_workflow.py` 就是这种）。真正会炸的是第三种：`async def` 里**只 `return` 不 `yield`**——那它变成协程，`async for` 会报 `TypeError: 'coroutine' object is not async iterable`。
+预期结果：只要实现 `run()`，语音层就能驱动你的全部逻辑。注意 `run` 的类型标注是 `-> AsyncIterator[str]`，而基类用的是普通 `def`。
+
+实现时两种写法都合法：**普通 `def` + `yield`**（生成器函数），或 **`async def` + `yield`**（异步生成器函数，仓库里的 `repo/examples/voice/streamed/my_workflow.py` 就是这种）。真正会炸的是第三种：`async def` 里**只 `return` 不 `yield`**。那它变成协程，`async for` 会报 `TypeError: 'coroutine' object is not async iterable`。
+
+整条链路的形状如下，文本在中间进、音频在最后出。
 
 ```text
 麦克风/文件 ──► STTModel.transcribe()          ──┐
@@ -49,13 +57,17 @@ class VoiceWorkflowBase(abc.ABC):
                           VoiceStreamEventAudio / Lifecycle / Error
 ```
 
-> 提示：第 26 章的 Realtime 是另一种做法——音频帧直接进模型，模型直接出音频，没有中间那层文本。本章的三段式把"思考"留在你的 Python 里，所以工具、handoff、护栏全都照旧可用；代价是多了一跳转写、多了一份延迟。
+预期结果：中间那层文本是你的地盘，前后两端由 SDK 负责换格式。
+
+> 提示：第 26 章的 Realtime 是另一种做法，音频帧直接进模型，模型直接出音频，没有中间那层文本。本章的三段式把"思考"留在你的 Python 里，所以工具、handoff、护栏全都照旧可用；代价是多了一跳转写、多了一份延迟。
 
 ---
 
 ## 二、最小可运行骨架
 
-这段代码要验证的是：不接麦克风也能跑通完整闭环——只要给一段 int16 的静音缓冲区。
+**不接麦克风也能跑通完整闭环，只要给一段 int16 的静音缓冲区。**
+
+这段代码验证的就是这件事。它构造三秒静音，交给 pipeline，然后消费事件流：
 
 ```python
 import asyncio
@@ -96,17 +108,32 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-三个关键点：
+预期结果：事件按 `turn_started`、若干 `audio`、`turn_ended`、`session_ended` 的顺序出现。
 
-- `pipeline.run()` 是 `async` 的，但它**不阻塞等到音频结束**，而是立刻返回一个 `StreamedAudioResult`，真正的转写 + Agent + 合成在后台 task 里跑（output._set_task(asyncio.create_task(...))）。
-- 必须消费 `result.stream()`。它是唯一的输出通道，也是错误通道：终端错误在消费过程中被抛出（见第六节）。
-- `VoicePipeline` 的四个参数全部 keyword-only：`workflow`、`stt_model`、`tts_model`、`config`。`stt_model` / `tts_model` 既接受已实例化的模型对象，也接受模型名字符串。
+想先确认环境能跑，就在 SDK 根目录执行下面两步。若你的 clone 在别的目录，按自己的路径替换 `cd` 后面那段。
+
+```bash
+# 工作目录：repo/openai-agents-python/（SDK 根目录）
+cd repo/openai-agents-python
+uv pip install -e ".[voice]"
+python examples/voice/static/main.py
+```
+
+预期结果：扬声器里放出一段合成的语音，脚本正常退出。
+
+三个关键点必须记住：
+
+| 要点 | 说明 |
+| --- | --- |
+| `pipeline.run()` 是 `async` 的，但**不阻塞等到音频结束** | 它立刻返回 `StreamedAudioResult`，真正的转写、Agent 调用、合成都在后台 task 里跑（output._set_task(asyncio.create_task(...))） |
+| 必须消费 `result.stream()` | 它是唯一的输出通道，也是错误通道；终端错误在消费过程中被抛出，见第六节 |
+| 四个参数全部 keyword-only | `workflow`、`stt_model`、`tts_model`、`config`；后两个既接受已实例化的模型对象，也接受模型名字符串 |
 
 ---
 
 ## 三、音频输入：整段 vs 流式
 
-两种输入对应两条完全不同的代码路径：
+**两种输入走两条完全不同的代码路径：一次性转写，和长连接会话。**
 
 | | `AudioInput` | `StreamedAudioInput` |
 | --- | --- | --- |
@@ -115,9 +142,16 @@ if __name__ == "__main__":
 | STT 路径 | `STTModel.transcribe()`（HTTP 一次性请求） | `STTModel.create_session()`（WebSocket 长连接） |
 | 适用 | 录音文件、按住说话（push-to-talk）、回归测试 | 实时对话、需要自动检测"说完了" |
 
-`AudioInput` 的字段是 `buffer`（int16 或 float32 的 numpy 数组）、`frame_rate`（默认 24000）、`sample_width`（默认 2 字节）、`channels`（默认 1）。注意 buffer 的 `dtype` 只接受 int16 / float32，别的会抛 `UserError`。
+`AudioInput` 只有四个字段，`buffer` 的类型限制最容易踩：
 
-流式一侧的手感是这样的：
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `buffer` | 无 | int16 或 float32 的 numpy 数组；别的 `dtype` 会抛 `UserError` |
+| `frame_rate` | 24000 | 采样率 |
+| `sample_width` | 2 | 每个采样点占 2 字节 |
+| `channels` | 1 | 单声道 |
+
+流式一侧要先把输入对象交给 pipeline，再从另一个 task 持续推数据。下面这段验证的就是推流与收尾：
 
 ```python
 from agents.voice import StreamedAudioInput, VoicePipeline
@@ -132,22 +166,26 @@ while recording:
 await audio_input.add_audio(None)        # None 表示输入结束
 ```
 
+预期结果：`add_audio(None)` 只关闭输入队列，转写 session 随后自行收尾。
+
 > 注意：add_audio(None) 只是关掉输入队列，不会替你生成 `session_ended`。收尾靠转写 session 关闭后走正常的 turn 流程；如果你在写 UI，请在 finally 里把 `result.stream()` 消费干净或主动取消，否则后台 task 会残留。
 
-**轮次检测（turn detection）由谁做？** 由 STT 模型那一侧做。`STTModelSettings.turn_detection` 默认是 {"type": "semantic_vad"}（见 `repo/src/agents/voice/models/openai_stt.py`），也就是说"用户说完了"这件事不是你判断的，是服务端 VAD 判断的。自己实现一个"按静音时长切句"的 VAD，通常只会让切句时机和转写结果打架。
+**轮次检测（turn detection）由 STT 模型那一侧做，不是你判断的。**`STTModelSettings.turn_detection` 默认是 {"type": "semantic_vad"}，见 `repo/src/agents/voice/models/openai_stt.py`。也就是说"用户说完了"这件事由服务端 VAD 判断。自己实现一个"按静音时长切句"的 VAD，通常只会让切句时机和转写结果打架。
 
 ---
 
 ## 四、Workflow：从 SingleAgentVoiceWorkflow 到自定义
 
-`SingleAgentVoiceWorkflow` 干的事只有四步（`repo/src/agents/voice/workflow.py`）：
+**`SingleAgentVoiceWorkflow` 只做四步，够用但不够灵活。**
+
+它的全部逻辑如下，见 `repo/src/agents/voice/workflow.py`：
 
 1. 把转写文本 append 进 _input_history；
 2. `Runner.run_streamed`(self._current_agent, self._input_history, context=self._context)；
 3. 用 `VoiceWorkflowHelper.stream_text_from(result)` 只挑出 `response.output_text.delta` 事件，作为文本块 yield 出去；
-4. 用 `result.to_input_list()` 和 result.last_agent 更新历史与当前 Agent（所以 handoff 在语音里自动生效）。
+4. 用 `result.to_input_list()` 和 result.last_agent 更新历史与当前 Agent，所以 handoff 在语音里自动生效。
 
-它**只支持一个起始 Agent + 无自定义逻辑**。一旦你要"用户说了暗号就切分支"、"先查数据库再决定用哪个 Agent"，就得继承 `VoiceWorkflowBase`：
+它**只支持一个起始 Agent + 无自定义逻辑**。一旦你要"用户说了暗号就切分支"，或者"先查数据库再决定用哪个 Agent"，就得继承 `VoiceWorkflowBase`。下面的例子在暗号命中时直接 yield 固定话术：
 
 ```python
 from collections.abc import AsyncIterator
@@ -180,15 +218,17 @@ class TriageWorkflow(VoiceWorkflowBase):
         self._agent = result.last_agent
 ```
 
-要点：**历史要你自己维护**。`SingleAgentVoiceWorkflow` 帮你做了，自定义 workflow 就得自己写；否则每一轮都是一次全新对话，Agent 会反复自我介绍。
+预期结果：用户说出"人工"两个字时，模型不会被调用，直接播报转接话术；其余情况走正常的流式回答。
 
-`on_start()` 只在流式输入的会话开始前跑一次，适合开场白。它产出的文本会被单独收成一轮（pipeline 内部会立刻 `_turn_done()`），不会和用户第一句话粘在一起——这个细节在 0.25 里是显式处理的，早期版本确实会把问候语和第一轮回答拼成一段。
+**历史要你自己维护。**`SingleAgentVoiceWorkflow` 帮你做了这件事，自定义 workflow 就得自己写。不写的话每一轮都是一次全新对话，Agent 会反复自我介绍。
+
+`on_start()` 只在流式输入的会话开始前跑一次，适合开场白。它产出的文本会被单独收成一轮，pipeline 内部会立刻 `_turn_done()`，不会和用户第一句话粘在一起。这个细节在 0.25 里是显式处理的，早期版本确实会把问候语和第一轮回答拼成一段。
 
 ---
 
 ## 五、VoicePipelineConfig：模型、语音与追踪
 
-`VoicePipelineConfig` 是 dataclass，字段如下：
+**`VoicePipelineConfig` 是 dataclass，语音链路的每个旋钮都收在这里。**
 
 | 字段 | 默认值 | 作用 |
 | --- | --- | --- |
@@ -203,7 +243,9 @@ class TriageWorkflow(VoiceWorkflowBase):
 | group_id | 随机 | 串联同一次会话的多个 trace |
 | trace_metadata | None | 附加元数据 |
 
-模型默认值（`repo/src/agents/voice/models/openai_model_provider.py`）：STT 是 `gpt-transcribe`，TTS 是 `gpt-4o-mini-tts`；TTS 的 `voice` 不填时用 ash。
+模型默认值见 `repo/src/agents/voice/models/openai_model_provider.py`：STT 是 `gpt-transcribe`，TTS 是 `gpt-4o-mini-tts`。TTS 的 `voice` 不填时用 ash。
+
+下面这段把上面几个字段落成代码，验证配置怎么组装：
 
 ```python
 from agents.voice import STTModelSettings, TTSModelSettings, VoicePipeline, VoicePipelineConfig
@@ -226,13 +268,15 @@ config = VoicePipelineConfig(
 pipeline = VoicePipeline(workflow=workflow, config=config)
 ```
 
+预期结果：pipeline 用 marin 音色、1.1 倍速合成，trace 里不再出现转写原文和音频字节。
+
 > 注意：`trace_include_sensitive_data=False` 只影响**pipeline 自己产生的 span**（转写 span、语音 span），不影响你 workflow 内部 Runner 产生的 trace。两套开关要分别关：这里关 pipeline，`RunConfig.trace_include_sensitive_data` 关 run。
 
 ---
 
 ## 六、事件流：VoiceStreamEvent 家族
 
-`result.stream()` 吐出三种事件，都是 dataclass，靠 type 字段区分：
+**`result.stream()` 只吐三种事件，全是 dataclass，靠 type 字段区分。**
 
 | 事件 | 关键字段 | 什么时候来 |
 | --- | --- | --- |
@@ -240,25 +284,27 @@ pipeline = VoicePipeline(workflow=workflow, config=config)
 | `VoiceStreamEventLifecycle` | event 取 `turn_started` / `turn_ended` / `session_ended` | 一轮开始、该轮音频发完、会话结束 |
 | `VoiceStreamEventError` | error: Exception | 后台 task 出错，同时 stream() 会在末尾抛出该异常 |
 
-几个容易误判的语义：
+有四个语义最容易误判：
 
-- `turn_started` 在**第一块文本进入 TTS 之前**发出（`StreamedAudioResult._start_turn`），不是收到音频时。所以它适合用来"静音麦克风"。
-- `turn_ended` 表示这一轮音频**已经全部投递到队列**，不等于"用户已经听完"。真正播完还要等你自己的播放器队列排空。
-- `session_ended` 是终止事件，stream() 见到它就把循环结束掉；之后若后台还存着异常，会在 finally 里抛出。所以**不要自己 break**——提前退出会让收尾逻辑走取消路径，你可能看不到真实的失败原因。
-- 顺序是有保证的：不同句子会并发合成，但 `_dispatch_audio` 按句子入队顺序把音频块发出来。你不需要自己做重排序。
+| 误判 | 正确理解 |
+| --- | --- |
+| 以为事件在收到音频时才来 | `turn_started` 在**第一块文本进入 TTS 之前**发出（`StreamedAudioResult._start_turn`），所以它适合用来"静音麦克风" |
+| 以为 `turn_ended` 就是播完了 | 它只表示这一轮音频**已经全部投递到队列**，不等于"用户已经听完"；真正播完还要等你自己的播放器队列排空 |
+| 以为可以自己 `break` 退出 | `session_ended` 是终止事件，stream() 见到它就结束循环；之后若后台还存着异常，会在 finally 里抛出。提前 break 会让收尾逻辑走取消路径，你可能看不到真实的失败原因 |
+| 担心并发合成会乱序 | 顺序是有保证的：不同句子会并发合成，但 `_dispatch_audio` 按句子入队顺序把音频块发出来，你不需要自己做重排序 |
 
 ---
 
 ## 七、中断打断：SDK 没做，你要自己做
 
-官方文档写得很清楚：**`StreamedAudioInput` 没有内建打断处理**。每检测到一轮转写，就触发一次独立的 workflow 运行。
+**SDK 不提供打断，只给你生命周期事件，所以打断是应用层的事。**
 
-这意味着两件事：
+官方文档写得很清楚：**`StreamedAudioInput` 没有内建打断处理**。每检测到一轮转写，就触发一次独立的 workflow 运行。这意味着两件事：
 
 1. 用户在 Agent 说话时插话，SDK 不会帮你取消上一轮；上一轮的音频还会继续合成、继续投递。
-2. 你能拿到的只有生命周期事件，所以"打断"是你应用层的事。
+2. 你能拿到的只有生命周期事件，"打断"得自己接。
 
-一个可用的最小策略：
+一个可用的最小策略是：播报时静音麦克风，检测到用户开口就清空播放队列。
 
 ```python
 speaking = False
@@ -280,15 +326,19 @@ async for event in result.stream():
         microphone.unmute()
 ```
 
-更稳的做法是**在音频播放侧做淡出**：直接 `flush()` 会"啪"一声。`repo/examples/realtime/cli/demo.py` 里 `_output_callback` 用 12ms 线性淡出 + 抖动缓冲的做法，可以原样搬到语音侧。
+预期结果：用户一插话，尚未播放的音频块被丢弃，麦克风立刻恢复采集。
 
-> 提示：如果你的产品对打断要求很高（电话场景、实时客服），认真评估第 26 章的 Realtime——打断、截断、回填历史这些它是内建的；三段式要自己拼一个"半成品"。
+更稳的做法是**在音频播放侧做淡出**，因为直接 `flush()` 会"啪"一声。`repo/examples/realtime/cli/demo.py` 里 `_output_callback` 用 12ms 线性淡出加抖动缓冲，这套做法可以原样搬到语音侧。
+
+> 提示：如果你的产品对打断要求很高（电话场景、实时客服），认真评估第 26 章的 Realtime。打断、截断、回填历史这些它是内建的，三段式要自己拼一个"半成品"。
 
 ---
 
 ## 八、测试：agents.voice.testing
 
-语音测试的两大痛点是没有麦克风、没有网络、输出不确定。`agents.voice.testing` 全部解决了：三个脚本化组件 + 一个 PCM 编码助手。
+**`agents.voice.testing` 把语音测试变成了纯单元测试：不需要麦克风，不需要网络。**
+
+语音测试有两痛点：没有麦克风、没有网络，输出还不确定。`agents.voice.testing` 用三个脚本化组件加一个 PCM 编码助手全解决了。下面这段验证整条链路的断言方式：
 
 ```python
 import numpy as np
@@ -324,18 +374,23 @@ async def test_voice_turn() -> None:
     workflow.assert_complete()
 ```
 
-设计要点：
+预期结果：四个断言全部通过，说明转写文本、TTS 输入、workflow 收到的转写、终止事件都对得上。
 
-- **每个脚本化组件都记录调用**（`stt.calls`、`tts.calls`、`workflow.transcriptions`），你能断言"送给 TTS 的到底是哪句文本"——这是排查"语音念错内容"最快的手段。
-- **`assert_complete()` 检查有没有剩余未消费的步骤**。脚本配了 3 轮却只跑了 2 轮，测试会失败；这能抓住"pipeline 少跑了一轮"这类静默 bug。
-- **可以塞异常**：`ScriptedTTSModel(results=[RuntimeError("boom")])` 用来测错误路径；`ScriptedTranscriptionSession(turns=[...], close_error=...)` 用来测收尾失败。
-- 流式场景用 `ScriptedSTTModel(sessions=[...])`；`ScriptedTranscriptionSession` 让你直接控制 `transcribe_turns()` 与 `close()`。
+设计要点有三条：
+
+| 要点 | 说明 |
+| --- | --- |
+| **每个脚本化组件都记录调用** | `stt.calls`、`tts.calls`、`workflow.transcriptions` 让你能断言"送给 TTS 的到底是哪句文本"，这是排查"语音念错内容"最快的手段 |
+| **`assert_complete()` 检查有没有剩余未消费的步骤** | 脚本配了 3 轮却只跑了 2 轮，测试会失败，能抓住"pipeline 少跑了一轮"这类静默 bug |
+| **可以塞异常** | `ScriptedTTSModel(results=[RuntimeError("boom")])` 用来测错误路径；`ScriptedTranscriptionSession(turns=[...], close_error=...)` 用来测收尾失败 |
+
+流式场景用 `ScriptedSTTModel(sessions=[...])`；`ScriptedTranscriptionSession` 让你直接控制 `transcribe_turns()` 与 `close()`。
 
 ---
 
 ## 九、成本与延迟优化
 
-语音是"按秒计费 + 人耳感知延迟"的双重压力。几个真正有效的旋钮：
+**语音是"按秒计费 + 人耳感知延迟"的双重压力，能拧的旋钮就这么几个。**
 
 | 目标 | 手段 | 代价 |
 | --- | --- | --- |
@@ -346,37 +401,37 @@ async def test_voice_turn() -> None:
 | 缩短转写成本 | 整段场景用 `AudioInput` 一次性转写，别开 WebSocket | 失去实时感 |
 | 减少模型调用 | 把"寒暄、确认、转接"交给规则直接 yield 文本，不进 Runner | 需要设计分支 |
 
-`TTSModelSettings` 还有两个进阶钩子：`text_splitter` 决定"攒到什么程度才送去合成"（默认按句末标点切，且合并后至少 20 字符），`transform_data` 让你在拿到 numpy 音频后做重采样、增益、AEC。这两个是延迟与音质的主战场。
+`TTSModelSettings` 还有两个进阶钩子。`text_splitter` 决定"攒到什么程度才送去合成"，默认按句末标点切，且合并后至少 20 字符；`transform_data` 让你在拿到 numpy 音频后做重采样、增益、AEC。这两个是延迟与音质的主战场。
 
 ---
 
 ## 常见坑与排查
 
 1. **`TypeError: 'coroutine' object is not async iterable`**
-   原因：`run` 写成了 `async def` 但函数体里没有 `yield`（只有 `return`），于是它返回协程而不是异步迭代器。修法：要么在 `async def` 里加 `yield`（异步生成器），要么改成普通 `def` + `yield`。
+   原因：`run` 写成了 `async def`，函数体里只有 `return` 没有 `yield`，于是它返回协程而不是异步迭代器。修法：要么在 `async def` 里加 `yield`（异步生成器），要么改成普通 `def` + `yield`。
 
 2. **Agent 每轮都重新自我介绍**
-   原因：自定义 workflow 没有维护历史，每轮都用只含一句话的输入去跑。修法：像 `SingleAgentVoiceWorkflow` 那样保存 `result.to_input_list()`，下一轮把整段历史传给 `Runner.run_streamed`。
+   原因：自定义 workflow 没有维护历史，每轮都拿只含一句话的输入去跑。修法：像 `SingleAgentVoiceWorkflow` 那样保存 `result.to_input_list()`，下一轮把整段历史传给 `Runner.run_streamed`。
 
 3. **stream() 里听不到 `session_ended`，程序卡住**
    原因：没有任何音频产出（例如 TTS 一直没拿到完整句子），dispatcher 从未启动。0.25 已在 `_done()` 里补了这个洞，但如果你自己实现了消费循环并提前 `break`，仍会走取消路径。修法：不要 `break`，让它自然结束；确实要提前退出就显式取消收尾。
 
 4. **流式场景一句话被拆成好几轮**
-   原因：`STTModelSettings.turn_detection` 覆盖不当，或你把 `language` 和流式专用的 `languages` 同时传了。修法：用 `languages`/`keywords`（`gpt-transcribe`、`gpt-live-transcribe` 支持），不要再传单数 `language`。
+   原因：`STTModelSettings.turn_detection` 覆盖不当，或你把 `language` 和流式专用的 `languages` 同时传了。修法：用 `languages` / `keywords`（`gpt-transcribe`、`gpt-live-transcribe` 支持），不要再传单数 `language`。
 
 5. **trace 里能看到转写全文，合规过不了**
    原因：`trace_include_sensitive_data` 默认为 `True`。修法：pipeline 侧关 `trace_include_sensitive_data` 与 `trace_include_sensitive_audio_data`，run 侧关 `RunConfig.trace_include_sensitive_data`，两边都要关。
 
 6. **`VoicePipeline` 报 ImportError: numpy + websockets are required**
-   原因：`voice` 是可选依赖。修法：`pip install 'openai-agents[voice]'`；麦克风/扬声器还需要额外装 `sounddevice`。
+   原因：`voice` 是可选依赖，没装就导入失败。修法：`pip install 'openai-agents[voice]'`；麦克风、扬声器还需要额外装 `sounddevice`。
 
 ---
 
 ## 动手练习
 
-1. **跑通静音闭环**：用第二节的骨架，把 `play()` 换成打印 `chunk.shape` 与 `chunk.dtype`，确认事件顺序是 `turn_started` → 若干 audio → `turn_ended` → `session_ended`。
-2. **加一轮开场白**：在 `SingleAgentVoiceWorkflow` 旁边写一个自定义 workflow，实现 `on_start()` 返回问候语，并验证问候语是**独立一轮**（观察 `turn_started` 出现了两次）。
-3. **改造示例**：打开 `repo/examples/voice/streamed/my_workflow.py`，把"暗号命中就 yield 固定文本"改成"暗号命中就 yield 一段从本地文件读出来的话术，并记录命中次数"，然后用 `agents.voice.testing` 里的思路给自己写一个不依赖麦克风的回归测试。
+1. **跑通静音闭环**：用第二节的骨架，把 `play()` 换成打印 `chunk.shape` 与 `chunk.dtype`。命令与第二节相同。确认事件顺序是 `turn_started` → 若干 audio → `turn_ended` → `session_ended`。
+2. **加一轮开场白**：在 `SingleAgentVoiceWorkflow` 旁边写一个自定义 workflow，实现 `on_start()` 返回问候语，并验证问候语是**独立一轮**：观察 `turn_started` 出现了两次。
+3. **改造示例**：打开 `repo/examples/voice/streamed/my_workflow.py`，把"暗号命中就 yield 固定文本"改成"暗号命中就 yield 一段从本地文件读出来的话术，并记录命中次数"。然后用 `agents.voice.testing` 的思路，给自己写一个不依赖麦克风的回归测试。
 
 ---
 
@@ -387,8 +442,7 @@ async def test_voice_turn() -> None:
 - `AudioInput` 走一次性转写，`StreamedAudioInput` 走 WebSocket + 服务端 VAD；轮次边界不是你判断的。
 - 自定义 workflow 必须自己维护 `to_input_list()` 历史，否则 Agent 失忆。
 - 生命周期只有三个事件，SDK 不提供打断；打断靠 `turn_started` / `turn_ended` 加播放侧 flush 自己做。
-- 延迟与成本的主旋钮是 `buffer_size`、`text_splitter`、`voice` 与 `speed`，以及"哪些话术用规则直接说"。
-- 测试一律用 `agents.voice.testing` 的脚本化模型，断言 calls 与 `assert_complete()`。
+- 延迟与成本的主旋钮是 `buffer_size`、`text_splitter`、`voice` 与 `speed`，以及"哪些话术用规则直接说"；测试一律用 `agents.voice.testing` 的脚本化模型，断言 calls 与 `assert_complete()`。
 
 ---
 
@@ -399,4 +453,4 @@ async def test_voice_turn() -> None:
 - 可运行示例：`repo/examples/voice/static/main.py`（整段音频）、`repo/examples/voice/streamed/main.py` 与 `repo/examples/voice/streamed/my_workflow.py`（麦克风流式）
 - 源码：`repo/src/agents/voice/pipeline.py`、`repo/src/agents/voice/result.py`、`repo/src/agents/voice/workflow.py`、`repo/src/agents/voice/model.py`
 - 测试范本：`repo/tests/voice/test_pipeline.py`、`repo/src/agents/voice/testing.py`
-- 下一章：《第26章 实时 Agent Realtime》——把中间那层文本拿掉，换成端到端 speech-to-speech。
+- 下一章：《第26章 实时 Agent Realtime》把中间那层文本拿掉，换成端到端 speech-to-speech。

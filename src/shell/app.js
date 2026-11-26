@@ -34,11 +34,11 @@
   }
   var RESOURCES = [
     { t: "上游仓库", d: "openai-agents-python 源码与全部文档", u: "https://github.com/openai/openai-agents-python" },
-    { t: "官方文档总览", d: "docs/index.md · 功能与选型", u: "https://github.com/openai/openai-agents-python/blob/main/docs/index.md" },
-    { t: "快速开始", d: "docs/quickstart.md", u: "https://github.com/openai/openai-agents-python/blob/main/docs/quickstart.md" },
-    { t: "可运行示例", d: "examples/ 下的完整项目", u: "https://github.com/openai/openai-agents-python/tree/main/examples" },
-    { t: "变更日志", d: "CHANGELOG.md · 版本演进", u: "https://github.com/openai/openai-agents-python/blob/main/CHANGELOG.md" },
-    { t: "Release 页面", d: "v0.25.0 发布说明", u: "https://github.com/openai/openai-agents-python/releases" },
+    { t: "官方文档总览", d: "docs/index.md · 功能与选型", u: "https://github.com/openai/openai-agents-python/blob/v0.25.0/docs/index.md" },
+    { t: "快速开始", d: "docs/quickstart.md", u: "https://github.com/openai/openai-agents-python/blob/v0.25.0/docs/quickstart.md" },
+    { t: "可运行示例", d: "examples/ 下的完整项目", u: "https://github.com/openai/openai-agents-python/tree/v0.25.0/examples" },
+    { t: "变更日志", d: "CHANGELOG.md · 版本演进", u: "https://github.com/openai/openai-agents-python/blob/v0.25.0/CHANGELOG.md" },
+    { t: "Release 页面", d: "v0.25.0 发布说明", u: "https://github.com/openai/openai-agents-python/releases/tag/v0.25.0" },
     { t: "MCP 规范", d: "Model Context Protocol", u: "https://modelcontextprotocol.io" },
     { t: "Pydantic 文档", d: "工具参数与结构化输出", u: "https://docs.pydantic.dev" },
   ];

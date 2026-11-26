@@ -1,6 +1,8 @@
 # 第6章 上下文与依赖注入
 
-上一章我们看到，一次 run 会留下 message、tool call、handoff 等一堆 item。这些 item 的产出者——工具函数、护栏、钩子、动态指令——都需要拿到"这一次请求的业务现场"：当前用户是谁、数据库连接在哪、日志器怎么拿。把它们塞进全局变量是灾难，塞进 prompt 是浪费 token。本章讲 SDK 给的答案：**本地上下文（local context）**，也叫依赖注入。
+上一章我们看到，一次 run 会留下 message、tool call、handoff 等一堆 item。这些 item 的产出者都需要拿到"这一次请求的业务现场"：当前用户是谁、数据库连接在哪、日志器怎么拿。
+
+工具函数、护栏、钩子、动态指令都是这样的产出者。把它们塞进全局变量是灾难，塞进 prompt 是浪费 token。本章讲 SDK 给的答案：**本地上下文（local context）**，也叫依赖注入。
 
 但先要拆掉一个高频混淆：SDK 里"上下文"有两个完全不同的东西。
 
@@ -10,7 +12,7 @@
 
 - 能区分"本地上下文"与"LLM 上下文"，并说出让数据进入 LLM 视野的四条正规路径。
 - 能说出 `RunContextWrapper` 里哪些字段属于你、哪些属于 SDK。
-- 能写出在 instructions、工具、护栏、hooks、交接回调五处取 context 的代码。
+- 能写出在 instructions、工具、护栏、hooks、交接（handoff）回调五处取 context 的代码。
 - 能判断什么时候该用 `ToolContext` 而不是 `RunContextWrapper`，并记住它的导入路径。
 - 能设计一个可序列化、可并发安全的上下文对象，并解释 `Agent[TContext]` 带来的类型收益。
 
@@ -18,7 +20,7 @@
 
 ## 一、两个"上下文"必须先分清
 
-`repo/docs/context.md` 开篇就把这个词劈成两半：
+"上下文"在 SDK 里指两种东西，混用会连累 token 与隐私。`repo/docs/context.md` 开篇就把这个词劈成两半：
 
 | | 本地上下文（local context） | LLM 上下文（agent/LLM context） |
 | --- | --- | --- |
@@ -28,24 +30,26 @@
 | 会发给模型吗 | **不会** | 就是发给模型的东西 |
 | 典型内容 | 数据库连接、logger、用户对象、租户配置 | 用户问题、历史消息、工具执行结果 |
 
-> 注意：context 对象**不会**被发送给模型。这是最常见的误解来源——你在 context 里放了"用户余额 128 元"，模型并不会因此知道，除非你把它写进指令、输入或工具返回值。
+> 注意：context 对象**不会**被发送给模型。这是最常见的误解来源。你在 context 里放了"用户余额 128 元"，模型并不会因此知道，除非你把它写进指令、输入或工具返回值。
 
-那怎么让模型知道？四条正规路径：
+那怎么让模型知道？四条正规路径，成本各不相同：
 
-1. **写进 `instructions`**（可以是动态函数，每次都带上最新值）；
-2. **放进 `input`**（比指令层级更低的消息）；
-3. **通过工具按需取**（模型自己决定何时查）；
-4. **通过检索或联网搜索**（把外部知识"落地"到对话里）。
+| 路径 | 做法 | 成本 |
+| --- | --- | --- |
+| 写进 `instructions` | 可以是动态函数，每次都带上最新值 | 每轮都付 |
+| 放进 `input` | 比指令层级更低的消息 | 最笨但最直接 |
+| 通过工具按需取 | 模型自己决定何时查 | 按需付 |
+| 通过检索或联网搜索 | 把外部知识"落地"到对话里 | 按相关性付 |
 
-这四条对应四种成本：指令是每轮都付、工具是按需付、检索是按相关性付、塞进输入是最笨但最直接的方式。
+还有一个反向的坑：把对话历史塞进 context 里"省事"。这条路会同时踩两个雷。模型看不到它，于是你又得复制进指令，白付一遍 token；`RunState` 序列化时又会把它整段写进快照，体积与隐私双输。
 
-还有一个反向的坑：把对话历史塞进 context 里"省事"。这条路会同时踩两个雷——模型看不到它（于是你又得复制进指令，白付一遍 token），`RunState` 序列化时又会把它整段写进快照（体积与隐私双输）。历史只有三个正经去处：`to_input_list()`、`session`、服务端的 `conversation_id`/`previous_response_id`（第 18 章）。
+历史只有三个正经去处：`to_input_list()`、`session`、服务端的 `conversation_id`/`previous_response_id`（第 18 章）。
 
 ---
 
 ## 二、RunContextWrapper 里到底有什么
 
-`RunContextWrapper[TContext]` 是个 dataclass，字段分两类：
+`RunContextWrapper[TContext]` 是个 dataclass，字段分两类：你的，和 SDK 的。
 
 | 字段 | 归属 | 说明 |
 | --- | --- | --- |
@@ -67,17 +71,17 @@ for entry in usage.request_usage_entries:
     print(entry.input_tokens, entry.output_tokens)
 ```
 
-这段要验证的是：**用量是 run 级别的，不是 Agent 级别的**。
+这段要验证的是：**用量是 run 级别的，不是 Agent 级别的**。预期输出形如 `2 1834 216 2050`，后面再跟每一条请求的明细。
 
 - 一次 run 里可能发生多次模型调用（工具回填、交接），`usage.requests` 反映的是真实调用次数。
-- 流式场景下 `usage` 要等流的最后几个块处理完才准确（源码注释原文：will be stale until the last chunk）。
+- 流式场景下 `usage` 要等流的最后几个块处理完才准确。源码注释原文是 will be stale until the last chunk。
 - `AgentHookContext` 是 `RunContextWrapper` 的子类，专门给 `on_agent_start`/`on_agent_end` 用，所以你在这两个钩子里同样能读 `context.usage`。
 
 ---
 
 ## 三、把 context 传进去
 
-标准写法是"dataclass 定义 + 泛型标注 + 传参"三步：
+标准写法是"dataclass 定义 + 泛型标注 + 传参"三步。下面这段把三步串成一个完整程序：
 
 ```python
 import asyncio
@@ -116,16 +120,20 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-要点：
+预期结果是模型先调一次 `fetch_open_tickets`，再基于返回值回答用户有几个未结工单。四个要点：
 
-- 工具函数把 `RunContextWrapper[...]` 写在**第一个参数**，SDK 会自动把它从工具 schema 里剔除——模型看不到这个参数，也不会试图填它。
-- 这个位置是硬约束：`repo/src/agents/function_schema.py` 会检查"上下文参数出现在非首位"并抛出明确错误。
-- `context` 可以是任意 Python 对象；dataclass 只是最常见的一种。
-- 同一份 context 会被所有 Agent、工具、护栏、钩子共享——**它们必须是同一个类型**，否则类型检查器会红，运行期则会在访问属性时炸。
+| 要点 | 说明 |
+| --- | --- |
+| 参数位置 | 工具函数把 `RunContextWrapper[...]` 写在**第一个参数**，SDK 会自动把它从工具 schema 里剔除。模型看不到这个参数，也不会试图填它。 |
+| 硬约束 | 这个位置不能变：`repo/src/agents/function_schema.py` 会检查"上下文参数出现在非首位"并抛出明确错误。 |
+| 类型自由 | `context` 可以是任意 Python 对象，dataclass 只是最常见的一种。 |
+| 类型一致 | 同一份 context 会被所有 Agent、工具、护栏、钩子共享，**它们必须是同一个类型**。否则类型检查器会红，运行期则会在访问属性时炸。 |
 
 ---
 
 ## 四、五个取 context 的地方
+
+context 有五处入口，签名各不相同，但都以 wrapper 开头：
 
 | 位置 | 拿到的对象 | 用途 |
 | --- | --- | --- |
@@ -181,17 +189,18 @@ def build_billing_handoff():
     return handoff(billing_agent, on_handoff=on_handoff)
 ```
 
-几个值得记住的细节：
+这段只定义函数与类，不产生输出；它的用途是把三处签名摆在一起对比。几个值得记住的细节：
 
 - **护栏函数签名是固定的三参数**：输入护栏是 `(context, agent, input)`，输出护栏是 `(context, agent, output)`。
-- **`on_handoff` 不能靠"返回值"阻止交接，也不能动态换目标**（`handoff()` 总是返回你在参数里捕获的那个 Agent，源码 docstring 明确说了这点）。要按 context 拒绝，就在回调里抛异常：默认 `failure_error_function=None`，异常会向上传播、直接结束这次 run；如果你给 `handoff(..., failure_error_function=default_tool_error_function)`，异常会变成模型可见的错误消息，交接失败但 run 继续。这个差别决定了"拒绝"是硬中断还是软回退。
-- **别在回调里改 `agent.tools`**。并发运行时替换工具列表会被检测并抛 `UserError`；要按运行切换能力，用 `FunctionTool.is_enabled` 这类基于 context 的回调（第 10 章）。
+- **`on_handoff` 不能靠"返回值"阻止交接，也不能动态换目标**。`handoff()` 总是返回你在参数里捕获的那个 Agent，源码 docstring 明确说了这点。要按 context 拒绝，就在回调里抛异常。
+- **抛异常之后的走向取决于 `failure_error_function`**。默认是 `None`，异常会向上传播、直接结束这次 run；如果你给 `handoff(..., failure_error_function=default_tool_error_function)`，异常会变成模型可见的错误消息，交接失败但 run 继续。这个差别决定了"拒绝"是硬中断还是软回退。
+- **别在回调里改 `agent.tools`**。并发运行时替换工具列表会被检测并抛 `UserError`。要按运行切换能力，用 `FunctionTool.is_enabled` 这类基于 context 的回调（第 10 章）。
 
 ---
 
 ## 五、ToolContext：工具级元数据
 
-当工具需要知道"这次调用的名字、call_id、原始参数字符串"时，用 `ToolContext`。它是 `RunContextWrapper` 的子类，最常用的几个额外字段是：
+当工具需要知道"这次调用的名字、call_id、原始参数字符串"时，用 `ToolContext`。它是 `RunContextWrapper` 的子类，额外字段中最常用的几个是：
 
 | 字段 | 含义 |
 | --- | --- |
@@ -202,7 +211,7 @@ def build_billing_handoff():
 | `tool_namespace` | Responses 命名空间（用了 `tool_namespace()` 时） |
 | `qualified_tool_name` | 带命名空间的完整工具名（属性） |
 
-导入路径有一个坑：**`ToolContext` 不在 `agents` 顶层导出**，要从子模块拿：
+导入路径有一个坑：**`ToolContext` 不在 `agents` 顶层导出**，要从子模块拿。下面这段既是导入示范，也是用法示范：
 
 ```python
 from agents import Agent
@@ -217,13 +226,15 @@ def refund(ctx: ToolContext[SupportContext], order_id: str) -> str:
     return f"订单 {order_id} 已退款（操作人 {ctx.context.user_id}）"
 ```
 
+预期结果是每次调用都会在日志里留下工具名、call_id 与原始参数，便于和外部系统对账。
+
 选择原则很简单：**只需要业务依赖 → `RunContextWrapper`；需要本次调用的元数据 → `ToolContext`**。因为 `ToolContext` 是子类，你随时可以只把它当 wrapper 用，不会失去 `.context`。
 
 ---
 
 ## 六、上下文对象怎么设计
 
-一条经验：**context 是"依赖容器 + 请求现场"，不是"储物间"**。推荐形态：
+context 是"依赖容器 + 请求现场"，不是"储物间"。推荐形态如下：
 
 ```python
 from dataclasses import dataclass, field
@@ -245,9 +256,9 @@ class RequestContext:
     cache: dict[str, Any] = field(default_factory=dict)   # 一次请求内的临时缓存
 ```
 
-四条设计准则：
+这个 dataclass 只做声明，本身不产生输出，但它把"依赖"与"现场"分开摆好了。四条设计准则：
 
-1. **依赖用协议或抽象类型**，不要写死具体类——测试时能换成假实现（第 23 章）。
+1. **依赖用协议或抽象类型**，不要写死具体类。测试时能换成假实现（第 23 章）。
 2. **一次请求一个实例**，不要在模块级共享。并发 run 共享同一个可变 context 会互相污染。
 3. **别放密钥**。`RunState` 序列化会把 context 一起写出去（下一节）。
 4. **别把对话历史放进去**。历史属于 `session` / `to_input_list()` / `previous_response_id`，那是另一套机制（第 17、18 章）。
@@ -256,7 +267,7 @@ class RequestContext:
 
 ## 七、序列化与并发
 
-这是本章最容易被低估的一节。`RunState` 在持久化时**会尝试序列化 context**（`repo/src/agents/run_state.py` 的 `_serialize_context_payload`）：
+这是本章最容易被低估的一节。`RunState` 在持久化时**会尝试序列化 context**，实现见 `repo/src/agents/run_state.py` 的 `_serialize_context_payload`：
 
 | context 类型 | 序列化方式 | 恢复时 |
 | --- | --- | --- |
@@ -265,14 +276,16 @@ class RequestContext:
 | dataclass | `dataclasses.asdict` 且能 JSON 化 | 同上，会给出警告 |
 | 其他自定义对象 | **退化为空 dict** 并告警 | 必须提供 `context_serializer` |
 
-对应的 API 是 `RunState.to_json(context_serializer=..., strict_context=...)` 与 `RunState.from_string(initial_agent, s, context_deserializer=..., context_override=...)`。`strict_context=True` 时，非 mapping 且没有 serializer 会直接抛 `UserError`，而不是悄悄丢数据——生产环境建议打开。
+对应的 API 是 `RunState.to_json(context_serializer=..., strict_context=...)` 与 `RunState.from_string(initial_agent, s, context_deserializer=..., context_override=...)`。
+
+`strict_context=True` 时，非 mapping 且没有 serializer 会直接抛 `UserError`，而不是悄悄丢数据。生产环境建议打开。
 
 并发方面有三条硬事实：
 
-- **同一次 run 内**，派生出来的 wrapper 共享 `usage` 与审批状态；嵌套 `Agent.as_tool()` 会 fork 一个 wrapper（只多一个 `tool_input`），不会给你的应用状态做隔离副本。
+- **同一次 run 内**，派生出来的 wrapper 共享 `usage` 与审批状态。嵌套 `Agent.as_tool()` 会 fork 一个 wrapper（只多一个 `tool_input`），不会给你的应用状态做隔离副本。
 - **`usage` 是原地累加的**（`Usage.add` 直接改对象）。所以从同一个 `RunResult` 切出多个 `RunState` 时，SDK 会 `deepcopy` usage，避免一个断点的 token 记到另一个断点上。
-- **跨 run 并发**时，每个 run 传自己的 context 实例；共享一个可变对象就等于共享一把没有锁的账本。
-- **`turn_input` 是当前 turn 的输入项快照**。在钩子里记录"这一轮模型到底看到了什么"，用它比用 `result.to_input_list()` 更贴近现场；但它不是历史存储，别拿它做持久化。
+- **跨 run 并发**时，每个 run 传自己的 context 实例。共享一个可变对象就等于共享一把没有锁的账本。
+- **`turn_input` 是当前回合的输入项快照**。在钩子里记录"这一轮模型到底看到了什么"，用它比用 `result.to_input_list()` 更贴近现场。但它不是历史存储，别拿它做持久化。
 
 ---
 
@@ -322,18 +335,26 @@ class RequestContext:
 2. **给工具加审计**：用 `ToolContext` 打印每次工具调用的 `tool_name` 与 `tool_call_id`，然后在 `RunHooks.on_tool_end` 里打印同一条信息。对比两处的可获取信息差异。
 3. **改仓库示例**：打开 `repo/examples/basic/dynamic_system_prompt.py`，把 `CustomContext` 扩成一个含 `user_id` 与 `logger` 的 dataclass，并把风格选择改为由 `context.tier` 决定；再补一个只允许特定 tier 通过的 `@input_guardrail`。
 
+先跑一遍原版拿到基线。若仓库 clone 在别处，按自己的目录替换这一段路径：
+
+```bash
+# 工作目录：repo/openai-agents-python/（SDK 根目录）
+cd repo/openai-agents-python
+python examples/basic/dynamic_system_prompt.py
+```
+
+预期输出是一句带随机风格的问候，用来确认示例本身能跑通。
+
 ---
 
 ## 本章小结
 
 - 两个上下文：本地 context（注入依赖，不发给模型）与 LLM context（对话历史，模型唯一可见的信息）。
-- `RunContextWrapper` 里只有 `.context` 是你的；`.usage`、`.turn_input`、`.tool_input` 是 SDK 元数据。
-- 取 context 的五个位置：动态 instructions、工具、护栏、hooks、`on_handoff`；签名各不相同但都以 wrapper 开头。
+- `RunContextWrapper` 里只有 `.context` 是你的，`.usage`、`.turn_input`、`.tool_input` 是 SDK 元数据；取 context 的五个位置是动态 instructions、工具、护栏、hooks、`on_handoff`，签名各不相同但都以 wrapper 开头。
 - `ToolContext` 多了工具调用元数据，导入路径是 `agents.tool_context`。
 - context 应设计成"依赖容器 + 请求现场"：一次请求一个实例、依赖用协议、不放密钥、不放历史。
-- `RunState` 会序列化 context：mapping 最安全，自定义类型需要 serializer/deserializer，`strict_context=True` 可避免静默丢数据。
-- 同 run 内 usage 与审批状态共享；跨 run 并发必须各自持有 context。
-- `Agent[TContext]` 只提供静态类型收益，运行时不校验——所以要处处一致地参数化。
+- `RunState` 会序列化 context：mapping 最安全，自定义类型需要 serializer/deserializer，`strict_context=True` 可避免静默丢数据；同 run 内 usage 与审批状态共享，跨 run 并发必须各自持有 context。
+- `Agent[TContext]` 只提供静态类型收益，运行时不校验，所以要处处一致地参数化。
 
 ---
 

@@ -91,6 +91,12 @@ function extractGoals(md) {
   return block.split(/\r?\n/).filter((l) => /^\s*-\s+/.test(l))
     .map((l) => l.replace(/^\s*-\s+/, "").replace(/[\x60]/g, "").trim()).filter(Boolean);
 }
+// 源码引用统一指向课程基准版本，而非 main（main 会持续前进，与正文描述脱节）
+const REF_BRANCH = "v0.25.0";
+// 正文里指代"本机 SDK 副本"的路径（repo/openai-agents-python/…）是本地目录说明，
+// 不是仓库内路径，既不生成外链也不计入本章引用
+const LOCAL_ALIAS = /^openai-agents-python(\/|$)/;
+
 function linkifyRefs(html) {
   return html.replace(/<code>(repo\/[^<]+)<\/code>/g, function (whole, inner) {
     const raw = inner.trim();
@@ -103,10 +109,11 @@ function linkifyRefs(html) {
     }
     const clean = target.replace(/\/+$/, "");
     if (!clean || clean.indexOf("xxx") >= 0 || clean === "src/sample/simple.py") return whole;
+    if (LOCAL_ALIAS.test(clean)) return whole;
     const last = clean.split("/").pop() || "";
     const FILES_NO_EXT = ["Makefile", "Dockerfile", "LICENSE", "NOTICE", "Procfile", "Gemfile"];
     const isDir = wildcard || target.endsWith("/") || (last.indexOf(".") < 0 && FILES_NO_EXT.indexOf(last) < 0);
-    const url = "https://github.com/openai/openai-agents-python/" + (isDir ? "tree" : "blob") + "/main/" + clean;
+    const url = "https://github.com/openai/openai-agents-python/" + (isDir ? "tree" : "blob") + "/" + REF_BRANCH + "/" + clean;
     const tip = "在 GitHub 查看 " + clean + (wildcard ? "/" : "");
     return '<a class="src-ref" href="' + url + '" target="_blank" rel="noopener" title="' + tip + '"><code>' + inner + '</code><span class="sr-arrow">↗</span></a>';
   });
@@ -114,17 +121,20 @@ function linkifyRefs(html) {
 
 function extractRefs(md) {
   const seen = new Map();
-  for (const m of md.matchAll(/repo\/([A-Za-z0-9_\-./]+)/g)) {
+  // 代码块里出现的 repo/ 路径属于"本地操作示例"，不是源码引用，先剔除再扫描
+  const prose = md.replace(/```[\s\S]*?```/g, "");
+  for (const m of prose.matchAll(/repo\/([A-Za-z0-9_\-./]+)/g)) {
     let p = m[1].replace(/[.,;:!?]+$/, "");
     if (!p || p.includes("xxx") || p === "src/sample/simple.py") continue;
     const isDir = p.endsWith("/");
     const clean = isDir ? p.slice(0, -1) : p;
     if (!clean || clean === "") continue;
+    if (LOCAL_ALIAS.test(clean)) continue;
     const dir = isDir || !clean.includes(".");
     const key = clean + (dir ? "/" : "");
     if (seen.has(key)) continue;
     const kind = clean.startsWith("docs/") ? "doc" : clean.startsWith("examples/") ? "example" : clean.startsWith("src/") ? "src" : "other";
-    seen.set(key, { path: key, kind, dir, url: "https://github.com/openai/openai-agents-python/" + (dir ? "tree" : "blob") + "/main/" + clean });
+    seen.set(key, { path: key, kind, dir, url: "https://github.com/openai/openai-agents-python/" + (dir ? "tree" : "blob") + "/" + REF_BRANCH + "/" + clean });
   }
   const order = { doc: 0, example: 1, src: 2, other: 3 };
   return [...seen.values()].sort((a, b) => order[a.kind] - order[b.kind] || a.path.localeCompare(b.path));

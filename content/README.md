@@ -193,7 +193,8 @@ python examples/basic/hello_world.py
 | --- | --- |
 | 版本 | 以 openai-agents `0.25.0` 为基准；API 若与旧教程冲突，以本课程内附的源码路径为准 |
 | 代码 | Python 3.10+；`from agents import ...`；工具装饰器优先 `from agents.decorators import tool` |
-| 文件路径 | 文中 `repo/docs/xxx.md`、`repo/examples/xxx.py` 均指仓库内路径 |
+| 文件路径 | 文中 `repo/docs/xxx.md`、`repo/examples/xxx.py` 均指仓库内路径（自动链到 GitHub `v0.25.0`） |
+| 本地目录 | SDK 源码放在 `repo/openai-agents-python/`；课程站本身在 `repo/AgentLearning/`。命令块首行会标「工作目录」，均为相对路径 |
 | 术语 | handoff=交接；guardrail=护栏；turn=轮次；session=会话；tracing=追踪 |
 | 练习 | 每章 `动手练习` 至少完成前两题，第三题是"改仓库示例"，最值钱 |
 

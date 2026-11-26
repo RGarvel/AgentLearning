@@ -1,8 +1,10 @@
 # 第13章 沙箱Agent与真实工作区
 
-上一章我们把控制权在 Agent 之间交接，但那些 Agent 全都活在你的 Python 进程里，能碰到的文件就是你代码能碰到的文件。当任务变成"把一个真实仓库拉下来、装依赖、跑测试、改代码、产出 patch"时，进程内的工具就不够了：你需要一块**可以被弄脏、可以被丢弃、可以被快照恢复**的工作区。这正是 `SandboxAgent` 要解决的问题。
+上一章我们把控制权在 Agent 之间交接，但那些 Agent 全都活在你的 Python 进程里。它们能碰到的文件，就是你代码能碰到的文件。
 
-本章回答三件事：什么时候该把 Agent 放进沙箱、怎么声明它的工作区、怎么选后端并把成本与隔离控制在可接受范围内。
+当任务变成"把一个真实仓库拉下来、装依赖、跑测试、改代码、产出 patch"时，进程内的工具就不够了。你需要一块**可以被弄脏、可以被丢弃、可以被快照恢复**的工作区。
+
+这正是 `SandboxAgent` 要解决的问题。本章回答三件事：什么时候该把 Agent 放进沙箱（sandbox）、怎么声明它的工作区、怎么选后端并把成本与隔离控制在可接受范围内。
 
 ## 学习目标
 
@@ -14,11 +16,15 @@
 
 ## 一、SandboxAgent 只是换了执行边界
 
-先消除一个误解：`SandboxAgent` 不是新的运行时。源码里它就是 `class SandboxAgent(Agent[TContext])`（`repo/src/agents/sandbox/sandbox_agent.py`），因此 `prompt`、`tools`、`handoffs`、`mcp_servers`、`model_settings`、`output_type`、护栏、hooks 全部照旧，运行入口也还是 `Runner.run` / `run_sync` / `run_streamed`。
+先消除一个误解：`SandboxAgent` 不是新的运行时。
 
-变的只有一件事：**模型面对的工具不再直接操作你的宿主环境，而是绑定到一个活的沙箱会话上**。`exec_command` 跑在沙箱里，`apply_patch` 改的是沙箱里的文件，`view_image` 读的是沙箱里的图片。
+源码里它就是 `class SandboxAgent(Agent[TContext])`（`repo/src/agents/sandbox/sandbox_agent.py`）。所以 `prompt`、`tools`、`handoffs`、`mcp_servers`、`model_settings`、`output_type`、护栏、hooks 全部照旧，运行入口也还是 `Runner.run` / `run_sync` / `run_streamed`。
 
-它在 `Agent` 之上新增了四个字段，另外 `instructions` 的语义发生了变化（其余全部继承）：
+变的只有一件事：**模型面对的工具不再直接操作你的宿主环境，而是绑定到一个活的沙箱会话上**。
+
+`exec_command` 跑在沙箱里，`apply_patch` 改的是沙箱里的文件，`view_image` 读的是沙箱里的图片。
+
+它在 `Agent` 之上新增了四个字段，另外 `instructions` 的语义发生了变化。其余全部继承。
 
 | 字段 | 作用 | 什么时候用 |
 | --- | --- | --- |
@@ -28,15 +34,24 @@
 | `capabilities` | 沙箱原生能力（工具 + 提示片段 + 运行时行为） | 默认已是 `Filesystem + Shell + Compaction` |
 | `run_as` | 模型侧工具以哪个沙箱用户身份执行 | 需要用文件权限做读写隔离时才设 |
 
-而"这一次到底跑在哪台机器、哪个容器、用哪个镜像"全部属于运行期，放在 `RunConfig(sandbox=SandboxRunConfig(...))` 里。这个拆分不是为了好看：同一个 `SandboxAgent` 定义，本地开发用 Unix-local、CI 用 Docker、线上一部分流量丢给托管后端，改的只是 run config 一行。
+而"这一次到底跑在哪台机器、哪个容器、用哪个镜像"全部属于运行期，放在 `RunConfig(sandbox=SandboxRunConfig(...))` 里。
 
-一次沙箱运行的准备顺序是固定的，值得背下来（`repo/docs/sandbox/guide.md`）：先解析出沙箱会话（注入的 session → RunState 里的会话状态 → 显式的 `session_state` → 用 client 新建），再让 capabilities 处理 manifest，最后按"SDK 沙箱提示（或 `base_instructions`）→ `instructions` → capability 提示片段 → 远端挂载策略 → 渲染出的文件树"拼出最终指令，并把工具绑到会话上。
+这个拆分不是为了好看。同一个 `SandboxAgent` 定义，本地开发用 Unix-local、CI 用 Docker、线上一部分流量丢给托管后端，改的只是 run config 一行。
+
+一次沙箱运行的准备顺序是固定的，值得背下来（`repo/docs/sandbox/guide.md`）：
+
+1. 先解析出沙箱会话。依次尝试：注入的 session → RunState 里的会话状态 → 显式的 `session_state` → 用 client 新建。
+2. 让 capabilities 处理 manifest。
+3. 拼出最终指令。顺序是 SDK 沙箱提示（或 `base_instructions`）→ `instructions` → capability 提示片段 → 远端挂载策略 → 渲染出的文件树。
+4. 把工具绑到会话上。
 
 > 注意：沙箱不改变"轮次（turn）"的含义。一个 turn 仍是一次模型步进，不是一条 shell 命令。别指望"跑了 5 条命令 = 5 个 turn"。
 
 ## 二、Manifest：新鲜沙箱的工作区契约
 
-`Manifest` 描述的是**新建沙箱会话**时工作区长什么样：根目录、条目、环境变量、用户与组、以及工作区之外的额外路径授权。它在源码里是一个 Pydantic 模型，字段包括 `root`（默认 `/workspace`）、`entries`、`environment`、`users`、`groups`、`extra_path_grants`。
+`Manifest` 描述的是**新建沙箱会话**时工作区长什么样。
+
+它包含根目录、条目、环境变量、用户与组，以及工作区之外的额外路径授权。源码里它是一个 Pydantic 模型，字段包括 `root`（默认 `/workspace`）、`entries`、`environment`、`users`、`groups`、`extra_path_grants`。
 
 条目（entry）决定"起跑线放什么"：
 
@@ -47,10 +62,10 @@
 | `GitRepo` | 在沙箱里 clone 一个仓库，可以钉 `ref` |
 | `S3Mount` / `GCSMount` / `R2Mount` / `AzureBlobMount` / `BoxMount` / `S3FilesMount` | 把远端存储挂进来 |
 
-三条硬规则，违反了会直接报错而不是"行为奇怪"：
+三条硬规则，违反了会直接报错，而不是"行为奇怪"。
 
-1. 条目路径是**工作区相对路径**，不能是绝对路径，也不能用 `..` 逃出工作区。这让同一份 manifest 在本地、Docker、托管后端之间可移植。
-2. `LocalFile.src` / `LocalDir.src` 默认相对 **SDK 进程的工作目录**解析，且源必须落在这个目录之下，除非被 `extra_path_grants` 显式覆盖。
+1. 条目路径是**工作区相对路径**。不能是绝对路径，也不能用 `..` 逃出工作区。这让同一份 manifest 在本地、Docker、托管后端之间可移植。
+2. `LocalFile.src` / `LocalDir.src` 默认相对 **SDK 进程的工作目录**解析，且源必须落在这个目录之下。除非被 `extra_path_grants` 显式覆盖。
 3. `GitRepo` 依赖沙箱内 `PATH` 上的 `git`。装 Python SDK 不会替你装 git：Unix-local 要宿主有 git，Docker/托管要镜像里有 git。
 
 `extra_path_grants` 是"让 Agent 访问工作区之外的具体绝对路径"的唯一正当方式，例如 `/tmp` 或只读的 `/opt/toolchain`：
@@ -66,11 +81,21 @@ manifest = Manifest(
 )
 ```
 
-这段声明要验证的是"授权是显式的、可只读的"。两个细节：`host_path` 只有 Docker 支持（把宿主路径映射到容器内另一个 POSIX 路径），Unix-local 只接受同路径授权并会拒绝 `host_path`；快照与 `persist_workspace()` **只覆盖工作区根目录**，被授权的路径是运行期访问权限，不是可持久化的状态。
+预期：两个路径被授权，`/tmp` 可写，`/opt/toolchain` 只读。
+
+这段要验证的是"授权是显式的、可只读的"。两个细节要记住。
+
+`host_path` 只有 Docker 支持，它把宿主路径映射到容器内另一个 POSIX 路径。Unix-local 只接受同路径授权，并会拒绝 `host_path`。
+
+快照与 `persist_workspace()` **只覆盖工作区根目录**。被授权的路径是运行期访问权限，不是可持久化的状态。
 
 > 注意：把 `extra_path_grants` 当成可信配置对待。不要根据模型输出或任何不可信载荷动态生成授权路径。
 
-需要多身份隔离时，用 `users` + `Permissions` + `run_as` 三件套：`Permissions` 控制 manifest 物化出来的文件对 owner/group/other 的读写执行位，`run_as` 决定模型侧工具以哪个用户身份执行。两者都不等于"审批策略"——那是第 15 章的话题。
+需要多身份隔离时，用 `users` + `Permissions` + `run_as` 三件套。
+
+`Permissions` 控制 manifest 物化出来的文件对 owner/group/other 的读写执行位，`run_as` 决定模型侧工具以哪个用户身份执行。
+
+两者都不等于"审批策略"，那是第 15 章的话题。
 
 ## 三、capabilities：把沙箱原语装到 Agent 上
 
@@ -84,9 +109,17 @@ capability 是"能改 manifest、能追加指令、能往会话上绑工具"的�
 | `Memory` | 跨 run 的经验读写 | 需要 `Shell`；运行中更新记忆还需要 `Filesystem` |
 | `Compaction` | 上下文压缩后的采样与输入处理 | 长流程才需要关心 |
 
-`SandboxAgent.capabilities` 的默认值是 `Capabilities.default()`，也就是 `[Filesystem(), Shell(), Compaction()]`。这里有个极容易踩的语义：**如果你传 `capabilities=[...]`，这个列表会整体替换默认值**。写 `capabilities=[Shell()]` 的 Agent 不会改文件，因为 `Filesystem` 被你自己删掉了。要么写 `Capabilities.default() + [Skills(...)]`，要么把想保留的默认项显式列全。本章示例里的 `[Shell(), Filesystem()]` 就是这种"显式列全"：一次性的评审任务不需要 `Compaction`，但 `Filesystem` 必须手工写回来。
+`SandboxAgent.capabilities` 的默认值是 `Capabilities.default()`，也就是 `[Filesystem(), Shell(), Compaction()]`。
 
-`view_image` 有个反直觉的设计：它按文件内容识别 PNG/JPEG/GIF/WebP/BMP/TIFF，而不是看扩展名。扩展名是图片但内容不是，会被拒绝；内容确实是图片但文件名没扩展名，反而能读。SVG 则保留按扩展名识别的兼容路径。
+这里有个极容易踩的语义：**如果你传 `capabilities=[...]`，这个列表会整体替换默认值**。写 `capabilities=[Shell()]` 的 Agent 不会改文件，因为 `Filesystem` 被你自己删掉了。
+
+要么写 `Capabilities.default() + [Skills(...)]`，要么把想保留的默认项显式列全。
+
+本章示例里的 `[Shell(), Filesystem()]` 就是这种"显式列全"：一次性的评审任务不需要 `Compaction`，但 `Filesystem` 必须手工写回来。
+
+`view_image` 有个反直觉的设计：它按文件内容识别 PNG/JPEG/GIF/WebP/BMP/TIFF，而不是看扩展名。
+
+扩展名是图片但内容不是，会被拒绝；内容确实是图片但文件名没扩展名，反而能读。SVG 则保留按扩展名识别的兼容路径。
 
 技能来源有四种写法，选错会得到"技能明明在磁盘上却加载不到"：
 
@@ -99,7 +132,13 @@ capabilities = Capabilities.default() + [
 ]
 ```
 
-这段要验证的是"懒加载技能"。`LocalDir.src` 指的是 **SDK 宿主进程**上的目录，不是沙箱里的路径；`lazy_from` 先让模型看到索引，用到哪个再物化到沙箱的 `skills_path`（默认 `.agents`），适合技能目录较大的场景；技能很小、希望一次性铺好就用 `Skills(from_=LocalDir(...))`；技能有自己的发布节奏就用 `Skills(from_=GitRepo(repo=..., ref=...))`。
+预期：模型先看到技能索引，用到哪个才把哪个物化进沙箱。
+
+这段要验证的是"懒加载技能"。`LocalDir.src` 指的是 **SDK 宿主进程**上的目录，不是沙箱里的路径。
+
+`lazy_from` 先让模型看到索引，用到哪个再物化到沙箱的 `skills_path`（默认 `.agents`），适合技能目录较大的场景。
+
+技能很小、希望一次性铺好，就用 `Skills(from_=LocalDir(...))`；技能有自己的发布节奏，就用 `Skills(from_=GitRepo(repo=..., ref=...))`。
 
 ## 四、选一个 sandbox client
 
@@ -135,7 +174,11 @@ run_config = RunConfig(
 )
 ```
 
-这段要验证的是"同一 Agent、只换执行后端"。`options` 是 client 专属的创建参数，Docker 和多数托管后端**必须**提供；`network_mode` 唯一支持的显式取值是 `"none"`，此时不能再暴露端口。
+预期：同一个 Agent 换到容器里跑，容器内没有网络；`network_mode="none"` 时也不能再暴露端口。
+
+这段要验证的是"同一 Agent、只换执行后端"。`options` 是 client 专属的创建参数，Docker 和多数托管后端**必须**提供。
+
+`network_mode` 唯一支持的显式取值是 `"none"`，此时不能再暴露端口。
 
 ## 五、会话、快照与断点恢复
 
@@ -147,9 +190,13 @@ run_config = RunConfig(
 | `SandboxRunConfig.session_state` | 显式序列化的沙箱连接状态 | 状态存在你自己的存储里时用，需要同时给 `client` |
 | `SandboxRunConfig.snapshot` | 工作区**内容**（文件与产物） | 让新沙箱从上次的文件继续，而不是从 manifest 从零开始 |
 
-一句话区分：`session_state` 是"接回同一个后端会话"，`snapshot` 是"用一个存好的工作区喂一个新沙箱"。前者要求后端能恢复，后者只要求能读快照。默认不传 `snapshot` 时，运行时会尝试用本地默认位置；搭不起来就退化成空快照（不持久化）。
+一句话区分：`session_state` 是"接回同一个后端会话"，`snapshot` 是"用一个存好的工作区喂一个新沙箱"。前者要求后端能恢复，后者只要求能读快照。
 
-生命周期有两种模式。**SDK 托管**适合一次 run 就结束的沙箱——传 `client`，Runner 负责建、启、跑、存档、删：
+默认不传 `snapshot` 时，运行时会尝试用本地默认位置。搭不起来就退化成空快照（不持久化）。
+
+生命周期有两种模式。
+
+**SDK 托管**适合一次 run 就结束的沙箱。传 `client`，Runner 负责建、启、跑、存档、删：
 
 ```python
 result = await Runner.run(
@@ -162,7 +209,9 @@ result = await Runner.run(
 )
 ```
 
-**开发者托管**适合要复用、要在 run 之后翻文件、要自己决定何时清理的场景——传 `session`，Runner 只用不管：
+预期：run 结束后沙箱由 Runner 收掉，你不需要手动清理。
+
+**开发者托管**适合要复用、要在 run 之后翻文件、要自己决定何时清理的场景。传 `session`，Runner 只用不管：
 
 ```python
 client = UnixLocalSandboxClient()
@@ -177,13 +226,31 @@ finally:
     await client.delete(sandbox)              # 资源是你建的，也得你删
 ```
 
-这段要验证的是"一个沙箱跑两次 run"。两个语义差别必须记住：`stop()` 只把工作区存进快照，**不拆沙箱**；`aclose()` 才是完整清理（跑 pre-stop 钩子、`stop()`、关资源）。而在 `client.create(...)` 之后，`client.delete(sandbox)` 才真正释放后端资源——`async with` 不会替你删。
+预期：两次 run 落在同一个沙箱里，第二次能看到第一次留下的文件。
+
+这段要验证的是"一个沙箱跑两次 run"。两个语义差别必须记住。
+
+`stop()` 只把工作区存进快照，**不拆沙箱**；`aclose()` 才是完整清理（跑 pre-stop 钩子、`stop()`、关资源）。
+
+而在 `client.create(...)` 之后，`client.delete(sandbox)` 才真正释放后端资源。`async with` 不会替你删。
 
 > 注意：序列化会**剥离凭据**。session state 与 `RunState` 里不含云挂载凭据、`host_path`、容器内凭据暴露确认。恢复时 SDK 只信任你当前传入的 manifest：拓扑不一致就**在沙箱启动前失败**，序列化状态本身永远不授予权限。所以恢复带挂载或 host 授权的会话，必须把可信 manifest（`SandboxRunConfig.manifest` 或 `agent.default_manifest`）一起给上。另外 `VercelSandboxClient` 不支持恢复已挂载的会话。
 
 ## 六、最小示例：给仓库做 code review
 
-把上面的零件拼起来。目标：钉住一个仓库、钉住一个 ref、跑测试、产出结构化评审结论，再把结论落成文件。这份代码改编自 `repo/examples/sandbox/tutorials/repo_code_review/main.py`，删掉了流式打印和 CLI。
+把上面的零件拼起来。目标是：钉住一个仓库、钉住一个 ref、跑测试、产出结构化评审结论，再把结论落成文件。
+
+这份代码改编自 `repo/examples/sandbox/tutorials/repo_code_review/main.py`，删掉了流式打印和 CLI。想跑原版，先确认工作目录：
+
+```bash
+# 工作目录：repo/openai-agents-python/（SDK 根目录）
+cd repo/openai-agents-python
+python examples/sandbox/tutorials/repo_code_review/main.py
+```
+
+如果你的仓库 clone 在别处（比如目录名就叫 `repo`），把上面的路径换成自己的即可，后文同此。
+
+下面这段是删掉流式与 CLI 之后的版本，用来对照结构。
 
 ```python
 import asyncio
@@ -272,6 +339,8 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
+预期：终端打印测试摘要和 `wrote N findings to review-output`，并在 `review-output/` 下写出 `review.md` 与 `findings.jsonl`。
+
 这段要验证的是"沙箱 + 结构化产出 + 事后取文件"这条完整链路。四个关键行值得单独说：
 
 - `GitRepo(repo=..., ref=...)` 把仓库钉在具体 commit 上。评审类任务必须钉 ref，否则同一个问题明天可能得出不同结论。
@@ -281,7 +350,11 @@ if __name__ == "__main__":
 
 ### 换成 Docker 或加一个只读评审员
 
-只需要换 run config。如果想让"评审员"和"修改员"各自有独立工作区，典型做法是给每个 `Agent.as_tool(...)` 传各自的 `run_config=RunConfig(sandbox=SandboxRunConfig(client=..., options=...))`；如果想让它们看同一个工作区但权限不同，就共享一个 `session` 并用 `run_as` 区分用户（`repo/examples/sandbox/sandbox_agents_as_tools.py`、`repo/examples/sandbox/shared_session_workdirs.py`）。
+换后端只需要改 run config。
+
+如果想让"评审员"和"修改员"各自有独立工作区，典型做法是给每个 `Agent.as_tool(...)` 传各自的 `run_config=RunConfig(sandbox=SandboxRunConfig(client=..., options=...))`。
+
+如果想让它们看同一个工作区但权限不同，就共享一个 `session` 并用 `run_as` 区分用户（`repo/examples/sandbox/sandbox_agents_as_tools.py`、`repo/examples/sandbox/shared_session_workdirs.py`）。
 
 ## 七、边界：什么时候不该用沙箱
 
@@ -295,18 +368,54 @@ if __name__ == "__main__":
 | 需要同一轮对话里"审"与"改"分离 | 共享 session + `run_as` + `Permissions` |
 | 任务纯文本、无文件 | 普通 `Agent` |
 
-成本上要有心理准备，钱主要花在四处：**会话存活时间**（托管后端通常按沙箱存活时长计费）、**镜像与冷启动**（Docker 拉镜像、托管后端排队）、**物化**（`LocalDir` 大目录、`GitRepo` clone、挂载初始化）、**快照归档**（每次 `stop()` 都要打包工作区）。控制手段也很直接：manifest 只放真正需要的目录；用 `concurrency_limits` 限制物化并发；用 `archive_limits` 限制解包资源；不在一个沙箱里塞十个互不相关的任务。
+成本上要有心理准备，钱主要花在四处：
 
-隔离上必须放弃幻想：**本地后端不等于隔离**。Unix-local 在 Linux 上就是宿主进程；工作区目录、`HOME`、`cwd` 都不构成访问边界。真正需要隔离时，用配置正确的 Docker（`network_mode="none"`、只挂必要的目录、非 root 用户）或托管后端，并且按最小权限发放凭据——挂载用短期、沙箱范围、只读的凭据，需要写回才开 `read_only=False`。
+| 花钱的地方 | 为什么 |
+| --- | --- |
+| 会话存活时间 | 托管后端通常按沙箱存活时长计费 |
+| 镜像与冷启动 | Docker 拉镜像、托管后端排队 |
+| 物化 | `LocalDir` 大目录、`GitRepo` clone、挂载初始化 |
+| 快照归档 | 每次 `stop()` 都要打包工作区 |
+
+控制手段也很直接：manifest 只放真正需要的目录；用 `concurrency_limits` 限制物化并发；用 `archive_limits` 限制解包资源；不在一个沙箱里塞十个互不相关的任务。
+
+隔离上必须放弃幻想：**本地后端不等于隔离**。
+
+Unix-local 在 Linux 上就是宿主进程。工作区目录、`HOME`、`cwd` 都不构成访问边界。
+
+真正需要隔离时，用配置正确的 Docker（`network_mode="none"`、只挂必要的目录、非 root 用户）或托管后端。并且按最小权限发放凭据：挂载用短期、沙箱范围、只读的凭据，需要写回才开 `read_only=False`。
 
 ## 常见坑与排查
 
-1. **改了 manifest，沙箱里却没变。** 原因：你复用了一个已存在的 `session`，或从 `snapshot` / `session_state` 恢复，工作区内容由它们决定，`manifest` 只对新建会话生效。修法：确认这次 run 走的是"新建"分支；需要新工作区就新建会话，而不是改 manifest 后重跑。
-2. **`apply_patch` 报找不到文件。** 原因：patch 路径以工作区根为准（配了 `cwd` 则以 `cwd` 为准），**不跟随 shell 命令的 `workdir`**。修法：统一在 `instructions` 里写清"patch 路径从哪算起"，或显式给 `SandboxRunConfig.cwd`。
-3. **自建 capabilities 后 Agent 不会改文件了。** 原因：`capabilities=[...]` 整体替换默认列表，你漏掉了 `Filesystem()`。修法：`Capabilities.default() + [...]`，或把 `Filesystem()` 显式加回。
-4. **恢复会话在启动前就失败。** 原因：序列化剥离了 `host_path` 与挂载凭据，而恢复时你没有提供拓扑一致的可信 manifest。修法：把同一份 `Manifest` 通过 `SandboxRunConfig.manifest` 或 `agent.default_manifest` 传进去；永远不要从不可信输入推导宿主路径。
-5. **Windows 上跑 Unix-local 直接报错。** 原因：Unix-local 只支持 macOS/Linux。修法：换 `DockerSandboxClient` 或托管后端。
-6. **`GitRepo` 物化失败。** 原因：沙箱里没有 `git`。修法：Unix-local 装 git；Docker/托管在镜像里预装 git。
+1. **改了 manifest，沙箱里却没变**
+   - 症状：工作区内容与新的 manifest 对不上。
+   - 原因：你复用了一个已存在的 `session`，或从 `snapshot` / `session_state` 恢复；工作区内容由它们决定，`manifest` 只对新建会话生效。
+   - 修法：确认这次 run 走的是"新建"分支；需要新工作区就新建会话，而不是改 manifest 后重跑。
+
+2. **`apply_patch` 报找不到文件**
+   - 症状：patch 路径按 shell 里的写法写，却报文件不存在。
+   - 原因：patch 路径以工作区根为准（配了 `cwd` 则以 `cwd` 为准），**不跟随 shell 命令的 `workdir`**。
+   - 修法：统一在 `instructions` 里写清"patch 路径从哪算起"，或显式给 `SandboxRunConfig.cwd`。
+
+3. **自建 capabilities 后 Agent 不会改文件了**
+   - 症状：能执行命令，但写不了文件。
+   - 原因：`capabilities=[...]` 整体替换默认列表，你漏掉了 `Filesystem()`。
+   - 修法：`Capabilities.default() + [...]`，或把 `Filesystem()` 显式加回。
+
+4. **恢复会话在启动前就失败**
+   - 症状：沙箱还没起来就报错。
+   - 原因：序列化剥离了 `host_path` 与挂载凭据，而恢复时你没有提供拓扑一致的可信 manifest。
+   - 修法：把同一份 `Manifest` 通过 `SandboxRunConfig.manifest` 或 `agent.default_manifest` 传进去；永远不要从不可信输入推导宿主路径。
+
+5. **Windows 上跑 Unix-local 直接报错**
+   - 症状：client 初始化或启动即失败。
+   - 原因：Unix-local 只支持 macOS/Linux。
+   - 修法：换 `DockerSandboxClient` 或托管后端。
+
+6. **`GitRepo` 物化失败**
+   - 症状：clone 阶段报错。
+   - 原因：沙箱里没有 `git`。
+   - 修法：Unix-local 装 git；Docker/托管在镜像里预装 git。
 
 ## 动手练习
 
@@ -317,8 +426,7 @@ if __name__ == "__main__":
 ## 本章小结
 
 - `SandboxAgent` 继承 `Agent`，只多 `default_manifest` / `base_instructions` / `capabilities` / `run_as`；后端与会话全部由 `SandboxRunConfig` 决定。
-- `Manifest` 是**新鲜会话**的工作区契约；复用 session、`session_state`、`snapshot` 时它不是真相来源。
-- manifest 条目路径只能相对工作区，`LocalDir.src` 受 SDK 进程工作目录与 `extra_path_grants` 约束，快照只存工作区根。
+- `Manifest` 是**新鲜会话**的工作区契约；复用 session、`session_state`、`snapshot` 时它不是真相来源。条目路径只能相对工作区，`LocalDir.src` 受 SDK 进程工作目录与 `extra_path_grants` 约束，快照只存工作区根。
 - `capabilities=[...]` 会**替换**默认值；默认是 `Filesystem + Shell + Compaction`。
 - 选后端顺序：可信本地用 Unix-local（Linux 无 OS 隔离、Windows 不可用）→ 需要隔离用 Docker → 需要弹性用托管。
 - `session_state` 接回后端会话，`snapshot` 喂新会话内容；序列化剥离凭据，恢复要带可信 manifest。
