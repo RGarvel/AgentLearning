@@ -2,9 +2,9 @@
 
 上一章我们看到，一次 run 会留下 message、tool call、handoff 等一堆 item。这些 item 的产出者都需要拿到"这一次请求的业务现场"：当前用户是谁、数据库连接在哪、日志器怎么拿。
 
-工具函数、护栏、钩子、动态指令都是这样的产出者。把它们塞进全局变量是灾难，塞进 prompt 是浪费 token。本章讲 SDK 给的答案：**本地上下文（local context）**，也叫依赖注入。
+工具函数、护栏、钩子、动态指令都是这样的产出者。把它们塞进全局变量是灾难，塞进 prompt 是浪费 token。本章讲 SDK 给的答案：**本地上下文（local context）**，也叫依赖注入（dependency injection）。
 
-但先要拆掉一个高频混淆：SDK 里"上下文"有两个完全不同的东西。
+但先要拆掉一个高频混淆：SDK 里"上下文"有两个完全不同的东西。按这章走完，你会得到三样东西：一份两种上下文的对照表、一个能跑的注入脚本、一套可序列化的 context 设计准则。
 
 ---
 
@@ -20,7 +20,7 @@
 
 ## 一、两个"上下文"必须先分清
 
-"上下文"在 SDK 里指两种东西，混用会连累 token 与隐私。`repo/docs/context.md` 开篇就把这个词劈成两半：
+"上下文"在 SDK 里指两种东西，混用会连累 token 与隐私。`repo/docs/context.md` 开篇就把这个词劈成两半。
 
 | | 本地上下文（local context） | LLM 上下文（agent/LLM context） |
 | --- | --- | --- |
@@ -30,7 +30,7 @@
 | 会发给模型吗 | **不会** | 就是发给模型的东西 |
 | 典型内容 | 数据库连接、logger、用户对象、租户配置 | 用户问题、历史消息、工具执行结果 |
 
-> 注意：context 对象**不会**被发送给模型。这是最常见的误解来源。你在 context 里放了"用户余额 128 元"，模型并不会因此知道，除非你把它写进指令、输入或工具返回值。
+注意：context 对象**不会**被发送给模型。这是最常见的误解来源。你在 context 里放了"用户余额 128 元"，模型并不会因此知道，除非你把它写进指令、输入或工具返回值。
 
 那怎么让模型知道？四条正规路径，成本各不相同：
 
@@ -44,6 +44,20 @@
 还有一个反向的坑：把对话历史塞进 context 里"省事"。这条路会同时踩两个雷。模型看不到它，于是你又得复制进指令，白付一遍 token；`RunState` 序列化时又会把它整段写进快照，体积与隐私双输。
 
 历史只有三个正经去处：`to_input_list()`、`session`、服务端的 `conversation_id`/`previous_response_id`（第 18 章）。
+
+### 跑通本章示例的配置清单
+
+本章脚本都会真正跑一次 run，所以第 2 章那套配置必须先就位。下面把本章涉及的每一项列全，逐项说明漏了会报什么错。
+
+| 配置项 | 在哪设 | 漏了或设错会报什么错 |
+| --- | --- | --- |
+| `OPENAI_API_KEY`（或网关 key） | 环境变量，第 2 章 | 模型调用鉴权失败 |
+| 模型名 | `Agent(model=...)` | 网关场景沿用默认模型，报 `model not found` |
+| `context` 传参 | `Runner.run(context=...)` | 工具里 `ctx.context` 是 `None` |
+| 上下文参数位置 | 工具函数第一个参数 | 放非首位，启动时报错（`repo/src/agents/function_schema.py`） |
+| `ToolContext` 导入路径 | `from agents.tool_context import ToolContext` | 从顶层导入报 `ImportError` |
+| `context_serializer` / `strict_context` | `RunState.to_json(...)` | 恢复后 context 变空 dict 或静默丢数据 |
+| 每 run 一个 context 实例 | 入口层构造 | 共享可变实例，并发请求串数据 |
 
 ---
 
@@ -59,19 +73,36 @@
 | `tool_input` | SDK | 嵌套 `Agent.as_tool()` 运行时的结构化输入 |
 | `approve_tool` / `reject_tool` | SDK | 以代码方式改审批状态（第 15、16 章） |
 
-源码注释写得直白：**"Only `wrapper.context` is your app-defined object"**。其余都是运行时元数据，你可以读，但不应该改写。尤其 `usage`：
+源码注释写得直白：**"Only `wrapper.context` is your app-defined object"**。其余都是运行时元数据，你可以读，但不应该改写。下面这段验证 `usage` 是 run 级别的统计。
 
 ```python
-result = await Runner.run(agent, "订单 A123 什么状态？", context=user_ctx)
+import asyncio
 
-usage = result.context_wrapper.usage
-print(usage.requests, usage.input_tokens, usage.output_tokens, usage.total_tokens)
-# 预期输出（示例）：2 1834 216 2050
-for entry in usage.request_usage_entries:
-    print(entry.input_tokens, entry.output_tokens)
+from agents import Agent, Runner
+
+
+async def main() -> None:
+    agent = Agent(name="助手", instructions="简短回答。")
+    result = await Runner.run(agent, "你好")
+
+    usage = result.context_wrapper.usage
+    print(usage.requests, usage.input_tokens, usage.output_tokens, usage.total_tokens)
+    for entry in usage.request_usage_entries:
+        print(entry.input_tokens, entry.output_tokens)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-这段要验证的是：**用量是 run 级别的，不是 Agent 级别的**。预期输出形如 `2 1834 216 2050`，后面再跟每一条请求的明细。
+把它存成 `usage_demo.py`，放在 SDK 根目录 `openai-agents-python/` 下。运行命令：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python usage_demo.py
+```
+
+预期输出是四个数字（请求数、输入 token、输出 token、总计），后面跟每条请求的明细；具体数值随模型与提问变化。
 
 - 一次 run 里可能发生多次模型调用（工具回填、交接），`usage.requests` 反映的是真实调用次数。
 - 流式场景下 `usage` 要等流的最后几个块处理完才准确。源码注释原文是 will be stale until the last chunk。
@@ -81,7 +112,7 @@ for entry in usage.request_usage_entries:
 
 ## 三、把 context 传进去
 
-标准写法是"dataclass 定义 + 泛型标注 + 传参"三步。下面这段把三步串成一个完整程序：
+标准写法是"dataclass 定义 + 泛型标注 + 传参"三步。下面这段把三步串成一个完整程序，验证工具能从 `ctx.context` 读到业务数据。
 
 ```python
 import asyncio
@@ -120,6 +151,13 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
+把它存成 `context_injection_demo.py`，放在 SDK 根目录 `openai-agents-python/` 下。运行命令：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python context_injection_demo.py
+```
+
 预期结果是模型先调一次 `fetch_open_tickets`，再基于返回值回答用户有几个未结工单。四个要点：
 
 | 要点 | 说明 |
@@ -133,7 +171,7 @@ if __name__ == "__main__":
 
 ## 四、五个取 context 的地方
 
-context 有五处入口，签名各不相同，但都以 wrapper 开头：
+context 有五处入口，签名各不相同，但都以 wrapper 开头。
 
 | 位置 | 拿到的对象 | 用途 |
 | --- | --- | --- |
@@ -143,7 +181,7 @@ context 有五处入口，签名各不相同，但都以 wrapper 开头：
 | `RunHooks` / `AgentHooks` | `RunContextWrapper` 或 `AgentHookContext` | 记录审计、上报指标 |
 | `handoff(on_handoff=...)` | `RunContextWrapper[Any]`（带 `input_type` 时第二个参数是解析后的输入） | 交接前的权限校验、埋点 |
 
-下面这段把三类回调放在一起（省略了业务实现）：
+下面这段把三类回调放在一起。**这是片段，不是完整脚本**：它只定义函数与类、不产生输出，用途是把三处签名摆在一起对比。把它嵌到你的入口脚本，或第 14、15 章的护栏与交接实现里；`SupportContext` 来自上一节的 dataclass，`billing_agent` 在本片段内已定义。
 
 ```python
 from agents import (
@@ -189,7 +227,7 @@ def build_billing_handoff():
     return handoff(billing_agent, on_handoff=on_handoff)
 ```
 
-这段只定义函数与类，不产生输出；它的用途是把三处签名摆在一起对比。几个值得记住的细节：
+几个值得记住的细节：
 
 - **护栏函数签名是固定的三参数**：输入护栏是 `(context, agent, input)`，输出护栏是 `(context, agent, output)`。
 - **`on_handoff` 不能靠"返回值"阻止交接，也不能动态换目标**。`handoff()` 总是返回你在参数里捕获的那个 Agent，源码 docstring 明确说了这点。要按 context 拒绝，就在回调里抛异常。
@@ -211,12 +249,21 @@ def build_billing_handoff():
 | `tool_namespace` | Responses 命名空间（用了 `tool_namespace()` 时） |
 | `qualified_tool_name` | 带命名空间的完整工具名（属性） |
 
-导入路径有一个坑：**`ToolContext` 不在 `agents` 顶层导出**，要从子模块拿。下面这段既是导入示范，也是用法示范：
+导入路径有一个坑：**`ToolContext` 不在 `agents` 顶层导出**，要从子模块拿。下面这段既是导入示范，也是用法示范，并跑一次验证日志能落到。
 
 ```python
-from agents import Agent
+import asyncio
+from dataclasses import dataclass
+
+from agents import Agent, Runner
 from agents.decorators import tool
 from agents.tool_context import ToolContext
+
+
+@dataclass
+class SupportContext:
+    user_id: str
+    tier: str
 
 
 @tool
@@ -224,9 +271,31 @@ def refund(ctx: ToolContext[SupportContext], order_id: str) -> str:
     """为订单发起退款。"""
     print(f"[trace] tool={ctx.tool_name} call_id={ctx.tool_call_id} args={ctx.tool_arguments}")
     return f"订单 {order_id} 已退款（操作人 {ctx.context.user_id}）"
+
+
+async def main() -> None:
+    agent = Agent[SupportContext](
+        name="退款助手",
+        instructions="用户要退款时，必须调用 refund 工具。",
+        tools=[refund],
+    )
+    ctx = SupportContext(user_id="u_1024", tier="pro")
+    result = await Runner.run(agent, "订单 A123 要退款", context=ctx)
+    print(result.final_output)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-预期结果是每次调用都会在日志里留下工具名、call_id 与原始参数，便于和外部系统对账。
+把它存成 `tool_context_demo.py`，放在 SDK 根目录 `openai-agents-python/` 下。运行命令：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python tool_context_demo.py
+```
+
+预期输出先是一行 `[trace] tool=refund call_id=... args=...`，再是模型的收尾回复，便于和外部系统对账。
 
 选择原则很简单：**只需要业务依赖 → `RunContextWrapper`；需要本次调用的元数据 → `ToolContext`**。因为 `ToolContext` 是子类，你随时可以只把它当 wrapper 用，不会失去 `.context`。
 
@@ -234,7 +303,7 @@ def refund(ctx: ToolContext[SupportContext], order_id: str) -> str:
 
 ## 六、上下文对象怎么设计
 
-context 是"依赖容器 + 请求现场"，不是"储物间"。推荐形态如下：
+context 是"依赖容器 + 请求现场"，不是"储物间"。推荐形态如下。**这是片段，不是完整脚本**：它是一个 dataclass 设计模板，放在你自己模块的顶部；`UserRepo` 是你项目里定义的协议（本片段已给出），四个字段按实际依赖替换。
 
 ```python
 from dataclasses import dataclass, field
@@ -267,7 +336,7 @@ class RequestContext:
 
 ## 七、序列化与并发
 
-这是本章最容易被低估的一节。`RunState` 在持久化时**会尝试序列化 context**，实现见 `repo/src/agents/run_state.py` 的 `_serialize_context_payload`：
+这是本章最容易被低估的一节。`RunState` 在持久化时**会尝试序列化 context**，实现见 `repo/src/agents/run_state.py` 的 `_serialize_context_payload`。
 
 | context 类型 | 序列化方式 | 恢复时 |
 | --- | --- | --- |
@@ -303,6 +372,8 @@ class RequestContext:
 
 ## 常见坑与排查
 
+按症状查，每条都给出"症状 → 原因 → 修法"。
+
 1. **症状**：在 `instructions` 里写"用户余额见上下文"，模型开始编造数字。
    **原因**：context 不发给模型。
    **修法**：用动态指令把值拼进字符串，或提供工具让模型按需查询。
@@ -335,11 +406,10 @@ class RequestContext:
 2. **给工具加审计**：用 `ToolContext` 打印每次工具调用的 `tool_name` 与 `tool_call_id`，然后在 `RunHooks.on_tool_end` 里打印同一条信息。对比两处的可获取信息差异。
 3. **改仓库示例**：打开 `repo/examples/basic/dynamic_system_prompt.py`，把 `CustomContext` 扩成一个含 `user_id` 与 `logger` 的 dataclass，并把风格选择改为由 `context.tier` 决定；再补一个只允许特定 tier 通过的 `@input_guardrail`。
 
-先跑一遍原版拿到基线。若仓库 clone 在别处，按自己的目录替换这一段路径：
+先跑一遍原版拿到基线。若仓库 clone 在别处，按自己的路径替换：
 
 ```bash
-# 工作目录：repo/openai-agents-python/（SDK 根目录）
-cd repo/openai-agents-python
+# 工作目录：openai-agents-python/（SDK 根目录）
 python examples/basic/dynamic_system_prompt.py
 ```
 

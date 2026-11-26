@@ -1,8 +1,12 @@
 # 第12章 Handoffs深入
 
-第 11 章我们把"谁拥有最终答案"当成选架构的第一问。选定交接之后，问题立刻变得具体：交接工具叫什么、模型能不能带参数、下一个 Agent 看到多少历史、交错了怎么办。
+第 11 章我们把"谁拥有最终答案"当成选架构的第一问，默认走了交接（handoff）这条路。选定交接之后，问题立刻变得具体：交接工具叫什么、模型能不能带参数、下一个 Agent 看到多少历史、交错了怎么办。
 
-这一章把 `handoff()` 的每个参数、输入过滤器的写法，以及 0.25 里仍是 beta 的"嵌套历史"讲清楚。最后落到一个三级转接的完整实现。
+这一章只有一条主线：把第十节的三级转接完整脚本跑通。一到九节是它的零件清单，按需回头查；其中裸 Agent、各种 `input_filter`、`nest_handoff_history` 都属于可选微调，不是默认值。
+
+按这章走完，你会得到一个能打印交接链的脚本，并能说清每个参数漏了会怎样。
+
+---
 
 ## 学习目标
 
@@ -11,7 +15,9 @@
 - 能写出三种 `input_filter`：删除工具项、只留最近 N 条、脱敏。
 - 能说清 `RunConfig.handoff_input_filter` 与 per-handoff 过滤器的优先级。
 - 能解释 `nest_handoff_history` 解决什么问题，以及为什么它不能当脱敏用。
-- 能处理多跳交接、`last_agent` 定位，以及 session 与服务端会话的互斥约束。
+- 能跑通多级交接脚本，用 `last_agent` 定位，并处理 session 与服务端会话的互斥约束。
+
+---
 
 ## 一、handoff 在运行时是什么
 
@@ -31,21 +37,47 @@
 
 护栏的边界也随之确定。输入护栏只作用于链首 Agent，输出护栏只作用于产出最终输出的 Agent。
 
+### 路径与运行配置一次对齐
+
+本机 SDK 根目录是 `openai-agents-python/`；正文里的 `repo/xxx` 是课程的逻辑前缀，点击跳 GitHub，不用真的建 `repo` 目录。
+
+| 课程里写的（可点击） | 你本机打开的文件 |
+| --- | --- |
+| `repo/examples/handoffs/message_filter.py` | `openai-agents-python/examples/handoffs/message_filter.py` |
+| `repo/docs/handoffs.md` | `openai-agents-python/docs/handoffs.md` |
+
+如果你的源码 clone 在别处，把命令里的 `openai-agents-python` 换成自己的路径即可，后文不再重复。
+
+跑通主线脚本前，先把下面几项配齐。
+
+| 配置项 | 怎么设 | 漏了会报什么错 |
+| --- | --- | --- |
+| API Key | `OPENAI_API_KEY` | 鉴权失败；追踪提示 `OPENAI_API_KEY is not set` |
+| base URL | `OPENAI_BASE_URL` 或自定义 client | 请求发往官方，网关场景连接失败或 401 |
+| 模型名 | `Agent(model=...)` 或 `OPENAI_DEFAULT_MODEL` | 网关报 `model not found` |
+| API 形态 | `set_default_openai_api("chat_completions")` | 网关报 404 或"接口不支持" |
+| 工作目录 | `openai-agents-python/` | `python: can't open file` |
+| `max_turns` | `RunConfig(max_turns=...)` | 多跳链条撞 `MaxTurnsExceeded` |
+| `handoffs` | `Agent(handoffs=[...])` | 没有交接工具，链首 Agent 自己答到底 |
+| `trace()` | `with trace("...")` | 不报错，但一次交接链散成多条 trace |
+
+---
+
 ## 二、handoff() 的全参数
 
-`handoff()` 的参数不多，但每一个都对应一处行为。
+`handoff()` 的参数不多，但每一个都对应一处行为。先用一张表把它们和"漏了会怎样"对齐。
 
-| 参数 | 默认 | 说明 |
-| --- | --- | --- |
-| `agent` | 必填 | 交接目标；`handoff()` 永远只返回这一个目标 |
-| `tool_name_override` | `None` | 覆盖默认的 `transfer_to_<name>` |
-| `tool_description_override` | `None` | 覆盖默认描述（默认会拼接 `handoff_description`） |
-| `on_handoff` | `None` | 交接被调用时执行；参数个数由 `input_type` 决定 |
-| `input_type` | `None` | 声明交接工具的参数模型；必须同时给 `on_handoff` |
-| `input_filter` | `None` | 过滤传给下一个 Agent 的历史 |
-| `nest_handoff_history` | `None` | 单次交接覆盖 `RunConfig.nest_handoff_history` |
-| `is_enabled` | `True` | bool 或 `(ctx, agent) -> bool`，关掉即从工具列表消失 |
-| `failure_error_function` | `None` | 交接调用失败时给"调用方"的文本；`None` 表示异常照抛 |
+| 参数 | 默认 | 说明 | 漏了/写错会怎样 |
+| --- | --- | --- | --- |
+| `agent` | 必填 | 交接目标；`handoff()` 永远只返回这一个目标 | 不传直接 `TypeError` |
+| `tool_name_override` | `None` | 覆盖默认的 `transfer_to_<name>` | 不报错，沿用默认工具名 |
+| `tool_description_override` | `None` | 覆盖默认描述（默认会拼接 `handoff_description`） | 不报错，用默认描述 |
+| `on_handoff` | `None` | 交接被调用时执行；参数个数由 `input_type` 决定 | 与 `input_type` 不配对会抛 `UserError` |
+| `input_type` | `None` | 声明交接工具的参数模型；必须同时给 `on_handoff` | 只给它会抛 `UserError` |
+| `input_filter` | `None` | 过滤传给下一个 Agent 的历史 | 不报错，整段历史原样交给下一跳 |
+| `nest_handoff_history` | `None` | 单次交接覆盖 `RunConfig.nest_handoff_history` | 不设则沿用全局值（默认 `False`） |
+| `is_enabled` | `True` | bool 或 `(ctx, agent) -> bool`，关掉即从工具列表消失 | 不设则永远可用；类型写错在构建时报 |
+| `failure_error_function` | `None` | 交接调用失败时给"调用方"的文本；`None` 表示异常照抛 | 不设则异常直接冒给调用方 |
 
 签名规则很严格，写错直接 `UserError`。三种情况对照如下：
 
@@ -55,7 +87,7 @@
 | 有 `input_type` 时 `on_handoff` 的参数 | 必须恰好两个：`(ctx, input)` |
 | 无 `input_type` 时 `on_handoff` 的参数 | 必须恰好一个：`(ctx)` |
 
-这段验证带参数的交接。`input_type` 声明元数据，`on_handoff` 负责把它记下来。
+这段验证带参数的交接：`input_type` 声明元数据，`on_handoff` 负责把它记下来。
 
 ```python
 import asyncio
@@ -105,19 +137,32 @@ async def main() -> None:
         )
     print("last_agent:", result.last_agent.name)
     print(result.final_output)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
 预期先看到一行 `[handoff] escalate reason=... priority=...`，再看到 `last_agent: Human queue` 和人工 Agent 的答复。
+
+把它存成 `handoff_with_params.py`，放在 SDK 根目录 `openai-agents-python/` 下。运行命令：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python handoff_with_params.py
+```
+
+预期输出：一行日志、一行 `last_agent: Human queue`、一段答复。三行都出现才算交接与钩子都通了。
 
 `input_type` 只描述**交接工具的参数**。它不替换下一个 Agent 的主输入，也不参与选择目标。
 
 它适合传"模型当场决定的小元数据"，比如原因、优先级、语言。应用状态不要放这里，那属于 `RunContextWrapper.context`。
 
+---
+
 ## 三、直接传 Agent 与显式 handoff() 的差别
 
-两种写法在运行时等价。
-
-`handoffs=[billing_agent]` 和 `handoffs=[handoff(billing_agent)]` 效果一样，SDK 会把裸 Agent 转成默认 Handoff。差别只在可定制程度。
+两种写法在运行时等价。`handoffs=[billing_agent]` 和 `handoffs=[handoff(billing_agent)]` 效果一样，SDK 会把裸 Agent 转成默认 Handoff。差别只在可定制程度。
 
 | 能力 | 直接传 Agent | 显式 `handoff()` |
 | --- | --- | --- |
@@ -128,31 +173,59 @@ async def main() -> None:
 | 历史过滤 | 只能靠 `RunConfig.handoff_input_filter` | per-handoff `input_filter` |
 | 动态开关 | 不支持 | `is_enabled` |
 
-实用建议：**先用裸 Agent 跑通，需要定制时再升级成 `handoff()`**。
+主线用显式 `handoff()`，因为要 `input_type` 和日志。裸 Agent 是可选微调：只需最简单路由时，先用它跑通更省事。
 
 裸 Agent 的 `handoff_description` 就是最轻量的"何时该选我"提示。很多项目到这一步就够了。
 
+---
+
 ## 四、input_filter 的三种典型写法
 
-交接默认把整段历史交给目标 Agent，这在多数场景是对的。但三种情况必须过滤。
+交接默认把整段历史交给目标 Agent，多数场景这样是对的；但三种情况必须过滤。它们都是可选微调，主线脚本不加也能跑。
 
-**1. 删除所有工具项**。工具调用记录对下一个 Agent 通常无用，还占 token。官方准备了现成的：
+**1. 删除所有工具项**。工具调用记录对下一个 Agent 通常无用，还占 token。官方准备了现成的 `remove_all_tools`。
+
+这段验证"删掉工具项后交接仍能跑完"，是一份完整脚本。
 
 ```python
-from agents import Agent, handoff
+import asyncio
+
+from agents import Agent, Runner, handoff, trace
 from agents.extensions import handoff_filters
 
 faq_agent = Agent(name="FAQ agent", instructions="Answer FAQ questions.")
 faq_handoff = handoff(faq_agent, input_filter=handoff_filters.remove_all_tools)
+triage = Agent(
+    name="Triage",
+    instructions="Answer simple questions; hand FAQ questions to the FAQ agent.",
+    handoffs=[faq_handoff],
+)
+
+
+async def main() -> None:
+    with trace("remove tools demo"):
+        result = await Runner.run(triage, "What is your return policy?")
+    print(result.final_output)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
 预期：目标 Agent 拿到的历史里不再有任何工具条目，只剩对话文本。
 
-它删掉 `ToolCallItem`、`ToolCallOutputItem`、`HandoffCallItem`、`ReasoningItem`、审批项等结构化条目，也清掉 `input_history` 里对应类型的 dict。
+把它存成 `handoff_remove_tools.py`，放在 SDK 根目录 `openai-agents-python/` 下。运行命令：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python handoff_remove_tools.py
+```
+
+预期输出：一段 FAQ 答复。它删掉 `ToolCallItem`、`ToolCallOutputItem`、`HandoffCallItem`、`ReasoningItem`、审批项等结构化条目，也清掉 `input_history` 里对应类型的 dict。
 
 **它不会删掉已经写进普通消息文本里的工具结果**。这一点在脱敏场景很致命。
 
-**2. 只保留最近 N 条**。长对话交接给专家时，前面的寒暄没必要带走：
+**2. 只保留最近 N 条**。长对话交接给专家时，前面的寒暄没必要带走。
 
 ```python
 from agents import HandoffInputData
@@ -164,6 +237,8 @@ def keep_last_six(data: HandoffInputData) -> HandoffInputData:
         history = history[-6:]
     return data.clone(input_history=history, pre_handoff_items=())
 ```
+
+这是片段，不是完整脚本：把它放到第十节脚本的 Agent 定义区之前，作为 `handoff(..., input_filter=keep_last_six)` 的参数；`HandoffInputData` 由片段顶部的 import 提供，`Runner` 用第十节脚本的 import。
 
 预期：目标 Agent 只看到最后 6 条历史，本轮之前产生的条目被清空。
 
@@ -179,7 +254,7 @@ def keep_last_six(data: HandoffInputData) -> HandoffInputData:
 
 `clone(**kwargs)` 是最安全的改法，别手工 new 一个。
 
-**3. 脱敏**。把手机号、卡号从文本里替换掉：
+**3. 脱敏**。把手机号、卡号从文本里替换掉。
 
 ```python
 import re
@@ -201,13 +276,15 @@ def redact_cards(data: HandoffInputData) -> HandoffInputData:
     return data.clone(input_history=history)
 ```
 
+这是片段，不是完整脚本：把它放到第十节脚本的 Agent 定义区之前，作为 `handoff(..., input_filter=redact_cards)` 的参数；`HandoffInputData` 与 `re` 由片段顶部的 import 提供。
+
 预期：卡号在交给下一个 Agent 之前变成 `[redacted]`，其余文本一字不动。
+
+---
 
 ## 五、RunConfig.handoff_input_filter：全局默认
 
-一个一个交接写过滤器不现实。`RunConfig(handoff_input_filter=...)` 给整次 run 的所有交接设默认值。
-
-优先级上，**per-handoff 的 `input_filter` 优先**。
+一个一个交接写过滤器不现实，`RunConfig(handoff_input_filter=...)` 给整次 run 的所有交接设默认值。优先级上，**per-handoff 的 `input_filter` 优先**。
 
 ```python
 from agents import RunConfig
@@ -216,17 +293,19 @@ run_config = RunConfig(handoff_input_filter=handoff_filters.remove_all_tools)
 result = await Runner.run(triage, "Where is my order?", run_config=run_config)
 ```
 
+这是片段，不是完整脚本：把它嵌到第十节脚本的 `main()` 里，替换原来的 `Runner.run` 调用；`triage` 与 `Runner` 来自第十节脚本，`handoff_filters` 来自第四节第一段的 `from agents.extensions import handoff_filters`。
+
 预期：这次 run 里的每次交接都按 `remove_all_tools` 过滤，包括那些没有单独写 `input_filter` 的交接。
 
 它适合"公司统一合规要求：任何交接都不允许带工具参数"这类场景。
 
 注意它与 `nest_handoff_history` 互斥。只要设了任一过滤器，无论 handoff 级还是 run 级，自动嵌套就不生效。
 
+---
+
 ## 六、nest_handoff_history 与 handoff_history_mapper
 
-多级交接最烦的问题是**历史复利**。
-
-A 交给 B，B 交给 C，每次交接都把前面全部消息原样带过去。到第五跳时，上下文里已经有四份"交接说明"，token 爆炸、重点模糊。
+多级交接最烦的问题是**历史复利**。A 交给 B，B 交给 C，每次交接都把前面全部消息原样带过去。到第五跳时，上下文里已经有四份"交接说明"，token 爆炸、重点模糊。
 
 `nest_handoff_history` 解决的正是这件事。它在 `RunConfig` 上默认 `False`，仍是 beta。
 
@@ -250,25 +329,34 @@ run_config = RunConfig(
 )
 ```
 
+这是片段，不是完整脚本：把它嵌到第十节脚本的 `main()` 里，作为 `Runner.run` 的 `run_config` 参数；`Runner` 来自第十节脚本的 import。
+
 预期：下一跳收到的是尾部 8 条的摘要版本，而不是完整历史。
 
-规则要记牢，否则会踩到很隐晦的坑：
+规则要记牢，否则会踩到很隐晦的坑。
 
-- 只设 `nest_handoff_history=True` 时用内置摘要；设了 `handoff_history_mapper` 时，**它的返回值就是下一跳的完整输入历史**。
-- 单次交接可以用 `handoff(..., nest_handoff_history=True/False)` 覆盖全局。
-- **它不是脱敏机制**。摘要由 `input_history`、`pre_handoff_items`、`new_items` 拼出来，工具参数与输出可能原样进摘要。要脱敏，就在调用它之前清洗这三个字段，或清洗它返回的 `input_history`。
-- 只过滤 `input_items` **不能**阻止内容进入嵌套摘要。
-- 想换包裹标记，用 `set_conversation_history_wrappers(start=..., end=...)`；换回来用 `reset_conversation_history_wrappers()`。
+| 规则 | 说明 |
+| --- | --- |
+| 只设 `nest_handoff_history=True` | 用内置摘要 |
+| 设了 `handoff_history_mapper` | 它的返回值就是下一跳的完整输入历史 |
+| 单次交接覆盖 | 用 `handoff(..., nest_handoff_history=True/False)` |
+| 它不是脱敏机制 | 摘要由 `input_history`、`pre_handoff_items`、`new_items` 拼出来，工具参数与输出可能原样进摘要；要脱敏就先清洗这三个字段，或清洗它返回的 `input_history` |
+| 只过滤 `input_items` | 不能阻止内容进入嵌套摘要 |
+| 换包裹标记 | `set_conversation_history_wrappers(start=..., end=...)`；换回来用 `reset_conversation_history_wrappers()` |
+
+---
 
 ## 七、on_handoff 里做什么
 
-`on_handoff` 在"确定要交接"之后、"切换 Agent"之前执行。
+`on_handoff` 在"确定要交接"之后、"切换 Agent"之前执行。这是唯一一个"你已经知道要转给谁、但对方还没开始说话"的时刻。
 
-这是唯一一个"你已经知道要转给谁、但对方还没开始说话"的时刻。适合做三件事：
+它适合做三件事：
 
-1. **留痕**：把 `input_type` 里的 `reason` 写进业务日志或工单系统（上面的例子）。
-2. **预取**：立刻按客户 ID 拉订单，塞进 `ctx.context`，目标 Agent 一上来就有数据。
-3. **授权检查**：`is_enabled` 在模型产出参数之前求值，**无法**校验参数内容；需要按字段做授权时，就在 `on_handoff` 开头检查并 `raise`，抛异常即中止交接。
+| 用途 | 做法 |
+| --- | --- |
+| 留痕 | 把 `input_type` 里的 `reason` 写进业务日志或工单系统（第二节的例子） |
+| 预取 | 立刻按客户 ID 拉订单，塞进 `ctx.context`，目标 Agent 一上来就有数据 |
+| 授权检查 | `is_enabled` 在模型产出参数之前求值，**无法**校验参数内容；需要按字段做授权时，就在 `on_handoff` 开头检查并 `raise`，抛异常即中止交接 |
 
 注意 `on_handoff` 里已经发生的副作用不会回滚。
 
@@ -276,11 +364,11 @@ run_config = RunConfig(
 
 两者的分工是：**需要模型决定的元数据用 `on_handoff`，只需要知道"谁转给谁"用 hooks**。
 
+---
+
 ## 八、多跳、last_agent 与"多个交接同时请求"
 
-多跳很常见：分诊 → 专家 → 人工。
-
-全程一个 run，`result.last_agent` 指向最后接手的 Agent。流式场景则用 `result.current_agent`。
+多跳很常见：分诊 → 专家 → 人工。全程一个 run，`result.last_agent` 指向最后接手的 Agent。流式场景则用 `result.current_agent`。
 
 想看完整轨迹，遍历 `result.new_items` 里的 `HandoffCallItem` 与 `HandoffOutputItem`。
 
@@ -292,21 +380,27 @@ run_config = RunConfig(
 
 这是刻意的：一次只能有一个"当前 Agent"。
 
+---
+
 ## 九、session 与服务端会话的互斥约束
 
-交接与服务端托管会话互斥。
+交接与服务端托管会话互斥，三条约束要记清。
 
-- 交接**不支持服务端托管会话**（`conversation_id`、`previous_response_id`、`auto_previous_response_id`）。设了 `input_filter` 会直接 `UserError`；设了 `nest_handoff_history` 会打 warning 并自动关闭，退回"只发增量输入"。
-- 客户端 `session` 与交接兼容，因为历史由 SDK 组装。但一个 run 只能选一种状态策略。
-- 交接发生在**同一个 run** 内，所以 `max_turns` 是整个链条共享的预算，不是每跳一份。多级转接很容易撞上限，记得调大。
+| 约束 | 具体表现 | 该怎么选 |
+| --- | --- | --- |
+| 服务端托管会话 | `conversation_id`、`previous_response_id`、`auto_previous_response_id` 都不支持交接 | 设了 `input_filter` 会直接 `UserError`；设了 `nest_handoff_history` 会打 warning 并自动关闭，退回"只发增量输入" |
+| 客户端 `session` | 与交接兼容，历史由 SDK 组装 | 一个 run 只能选一种状态策略 |
+| `max_turns` | 交接发生在**同一个 run** 内，预算整条链共享 | 不是每跳一份；多级转接很容易撞上限，记得调大 |
 
 实践上的取舍很清楚。需要精细控制"每一跳看到什么"的系统，必须用客户端 `session` 加过滤器。
 
 只想省事、且能接受整体历史自动延续的，才用服务端会话。这时要把交接设计成"不改变权限级别"的平级转接。
 
+---
+
 ## 十、三级转接完整示例
 
-分诊 → 账单专家 → 人工队列。两跳，三种工具，一个结构化交接参数。
+本章主线到这里收口：分诊 → 账单专家 → 人工队列。两跳，三种工具，一个结构化交接参数。
 
 这段验证完整链路：两次交接，一个 `input_type`，一个 `on_handoff` 日志。
 
@@ -380,9 +474,22 @@ if __name__ == "__main__":
 
 预期输出里能看到 `final agent: Human agent`，`handoffs` 列表有两条交接记录，最后是人工 Agent 的答复。
 
+把它存成 `three_level_handoff.py`，放在 SDK 根目录 `openai-agents-python/` 下。运行命令：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python three_level_handoff.py
+```
+
+预期输出：三行，依次是 `final agent: Human agent`、两条 handoff 记录、人工答复。这是本章的总验收点。
+
 如果第二跳没发生，先检查账单专家的 instructions 是否真的写了阈值。交接是否发生，本质上是模型基于工具描述做的决策，而不是代码分支。
 
+---
+
 ## 常见坑与排查
+
+按症状查，每条都给出"症状 → 原因 → 修法"。
 
 1. **交接后目标 Agent 完全不记得前文**
    - 症状：接手后一问三不知，像刚进对话。
@@ -414,21 +521,26 @@ if __name__ == "__main__":
    - 原因：`max_turns` 是整条链共享。
    - 修法：按链路长度设置（例如每跳预留 3-5 轮）。
 
+---
+
 ## 动手练习
 
 三题都在 SDK 根目录下完成。先跑一遍基线示例，确认环境是通的：
 
 ```bash
-# 工作目录：repo/openai-agents-python/（SDK 根目录）
-cd repo/openai-agents-python
+# 工作目录：openai-agents-python/（SDK 根目录）
+cd openai-agents-python
 python examples/handoffs/message_filter.py
 ```
 
-如果你的仓库 clone 在别处（比如目录名就叫 `repo`），把上面的路径换成自己的即可，后文命令同此。
+预期输出一段翻译或过滤后的答复。如果你的源码 clone 在别处，把命令里的 `openai-agents-python` 换成自己的路径即可，后文命令同此。
 
-1. 给 `handoff(..., input_type=...)` 加一个 `priority` 字段，在 `on_handoff` 里按优先级决定是否直接 `raise` 拒绝交接。
-2. 写一个 `input_filter`：保留全部 user 消息、删除所有工具项、并把 assistant 消息截断到 200 字。用 `to_input_list()` 打印验证效果。
-3. 打开 `repo/examples/handoffs/message_filter.py`，把它的 `spanish_handoff_message_filter` 改成同时调用 `nest_handoff_history`，并说明为什么"先 remove_all_tools 再嵌套"与"先嵌套再过滤"结果不同。
+1. 立刻运行本章的 `three_level_handoff.py`，确认 `handoffs` 列表有两条记录；再把输入里的 `899 CNY` 改成小额，观察第二跳是否消失。
+2. 给 `handoff(..., input_type=...)` 加一个 `priority` 字段，在 `on_handoff` 里按优先级决定是否直接 `raise` 拒绝交接。
+3. 写一个 `input_filter`：保留全部 user 消息、删除所有工具项、并把 assistant 消息截断到 200 字。用 `to_input_list()` 打印验证效果。
+4. 打开 `repo/examples/handoffs/message_filter.py`，把它的 `spanish_handoff_message_filter` 改成同时调用 `nest_handoff_history`，并说明为什么"先 remove_all_tools 再嵌套"与"先嵌套再过滤"结果不同。
+
+---
 
 ## 本章小结
 
@@ -438,6 +550,8 @@ python examples/handoffs/message_filter.py
 - `nest_handoff_history` 治"历史复利"，不是安全机制；`handoff_history_mapper` 可完全接管下一跳输入。
 - 服务端托管会话与交接过滤器互斥，多级转接要留足 `max_turns`。
 - `handoff_description` 与 `RECOMMENDED_PROMPT_PREFIX` 决定模型会不会在该转的时候转，值得和 instructions 一起打磨。
+
+---
 
 ## 延伸阅读
 

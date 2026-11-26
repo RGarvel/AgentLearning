@@ -4,9 +4,21 @@
 
 一句被精心构造的输入，可能让昂贵的模型跑完十轮工具调用。一段本该脱敏的输出，可能把手机号直接交付给终端用户。
 
-这一章开始进入"安全与护栏"模块，先解决最靠前的一道防线。我们在输入进入模型之前、在最终答案交付给用户之前，插入确定性的检查，必要时立刻掐断整条流程。
+这一章进入"安全与护栏"模块，先解决最靠前的一道防线。我们在输入进入模型之前、在最终答案交付给用户之前，插入确定性的检查，必要时立刻掐断整条流程。
 
 护栏（guardrail）就是这套机制的官方名字。读完你会知道它怎么定义、在哪执行、又该花多少钱。
+
+按这一章走完，你会得到三样东西：一个能拦截竞品咨询的完整脚本、一张"漏配就报错"的配置对照表、一条从 tripwire 异常反查证据的排查路径。
+
+路径约定先说一次。课程正文里的 `repo/src/agents/guardrail.py` 是逻辑前缀，点击跳到 GitHub 上的 v0.25.0；本机上它对应 `openai-agents-python/src/agents/guardrail.py`。
+
+| 课程里写的（可点击） | 你本机打开的文件 |
+| --- | --- |
+| `repo/src/agents/guardrail.py` | `openai-agents-python/src/agents/guardrail.py` |
+| `repo/src/agents/run_config.py` | `openai-agents-python/src/agents/run_config.py` |
+| `repo/examples/agent_patterns/input_guardrails.py` | `openai-agents-python/examples/agent_patterns/input_guardrails.py` |
+
+本机目录就叫 `openai-agents-python/`，不叫 `repo`。若源码 clone 在别处，把命令里的 `openai-agents-python` 换成自己的路径即可，后文不再重复。
 
 ## 学习目标
 
@@ -18,23 +30,59 @@
 
 ## 护栏不是过滤器，是"断路器"
 
-护栏不是事后过滤器，而是运行器能读懂的断路器。理解这一点，才不会把它写成调用方的一个 `if`。
+护栏（circuit breaker）不是事后过滤器，而是运行器能读懂的断路器。理解这一点，才不会把它写成调用方的一个 `if`。
 
 初学护栏最容易走的路，是把校验写在 Agent 之外。跑完 `Runner.run`，拿到 `result.final_output`，自己写个 `if` 判断要不要展示。
 
-这样做有两个硬伤。第一，成本没有被拦住。模型已经跑完，token 已经花掉，工具可能已经删了文件。第二，语义没有被表达。你的业务规则散落在调用方代码里，下游想复用这套流程，得把逻辑再抄一遍。
+这样做有两个硬伤。第一，成本没有被拦住：模型已经跑完，token 已经花掉，工具可能已经删了文件。第二，语义没有被表达：你的业务规则散落在调用方代码里，下游想复用这套流程，得把逻辑再抄一遍。
 
 护栏的思路相反。它把"这条输入或这段输出合规吗"变成一个运行器可以理解的对象。你返回一个 `GuardrailFunctionOutput`，运行器读它的 `tripwire_triggered`。
 
 为真，它抛异常、停止执行；为假，它继续往下走。规则被搬到了 Agent 定义旁边，谁用这个 Agent，谁就自动继承这套规则。
 
-下面这段拦截免费租户的竞品咨询，验证最小可用护栏的写法。
+### 跑通本章要配齐什么（漏一项就报错）
+
+护栏本身不复杂，但要把脚本跑起来，下面几项一个都不能少。先看对照表，再照着主线做。
+
+| 配置项 | 在哪设 | 漏了会报什么错 |
+| --- | --- | --- |
+| Python 3.10+ 与 agents 0.25.0 | 第2章的 `uv venv` + `uv pip install -e .` | 3.9 下 import 就报语法错；版本不符则参数签名对不上 |
+| key / base URL / 模型名 / API 形态 | 第2章的环境变量或 `AsyncOpenAI` client | 并行模式下模型被调用时报鉴权失败或 `model not found` |
+| `from agents.decorators import ...` | 脚本顶部 import | 写成别的模块名会 `ImportError`；顶层 `agents` 也能导入，但本课统一用 `agents.decorators` |
+| `GuardrailFunctionOutput(output_info, tripwire_triggered)` | 护栏函数的 `return` | 返回其它形状会报 `TypeError: ... object is not callable`，或判定永远为假 |
+| `tripwire_triggered` 用真正的 `bool` | 护栏函数内 | 写成字符串 `"false"` 会被当成真值，误拦所有输入 |
+| 三参数顺序 `(context, agent, input)` | 护栏函数定义 | 写反不会报错，运行时只会拿到奇怪的值 |
+| `Agent(input_guardrails=..., output_guardrails=...)` | Agent 构造 | 不挂就等于没护栏，tripwire 永不触发 |
+| `Agent(output_type=Reply)` | Agent 构造 | 输出护栏收到的是 `str`，读 `.response` 会 `AttributeError` |
+| `run_in_parallel=False` | 装饰器可选参数 | 默认是 `True`，高危 Agent 会先跑工具再 trip，副作用无法撤销 |
+| `RunConfig.input_guardrails` / `output_guardrails` | `RunConfig` 构造 | 漏了就没有全局兜底，交接后的 Agent 无护栏 |
+| `RunConfig.output_guardrail_blocked_message` | `RunConfig` 构造 | 用默认英文占位文案；传 `async def` 会 `TypeError` |
+| 护栏内子调用带 `context=ctx.context` | 护栏里的 `Runner.run(...)` | 上下文丢字段，护栏误判 |
+
+一条贯穿全章的规则（见 `repo/docs/config.md`）：SDK 惰性解析配置，直到第一次真正创建客户端时才读这些值。所以所有配置都必须在第一次模型调用之前完成，之后设一律不生效。
+
+### 主线：一个能跑的拦截脚本
+
+下面这段把输入护栏、输出护栏和 tripwire 捕获装进一个完整脚本，验证"断路器"从定义、触发到话术的全过程。它是一段可直接运行的完整脚本，不是片段。
 
 ```python
+import asyncio
+import logging
 from dataclasses import dataclass
 
-from agents import Agent, GuardrailFunctionOutput, RunContextWrapper, TResponseInputItem
-from agents.decorators import input_guardrail
+from agents import (
+    Agent,
+    GuardrailFunctionOutput,
+    InputGuardrailTripwireTriggered,
+    OutputGuardrailTripwireTriggered,
+    RunContextWrapper,
+    Runner,
+    TResponseInputItem,
+)
+from agents.decorators import input_guardrail, output_guardrail
+from pydantic import BaseModel, Field
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -55,17 +103,89 @@ async def block_competitor_queries(
         output_info={"matched_keyword": "竞品", "tenant_id": ctx.context.tenant_id},
         tripwire_triggered=hit,
     )
+
+
+class Reply(BaseModel):
+    reasoning: str = Field(description="内部推理，不给用户看")
+    response: str = Field(description="给用户看的回复")
+
+
+@output_guardrail(name="no_phone_in_reply")
+async def no_phone(ctx, agent: Agent, output: Reply) -> GuardrailFunctionOutput:
+    leaked = "650" in output.response or "650" in output.reasoning
+    return GuardrailFunctionOutput(
+        output_info={"in_response": "650" in output.response, "in_reasoning": "650" in output.reasoning},
+        tripwire_triggered=leaked,
+    )
+
+
+agent = Agent(
+    name="客服",
+    instructions="回答客户问题。",
+    output_type=Reply,
+    input_guardrails=[block_competitor_queries],
+    output_guardrails=[no_phone],
+)
+
+
+async def chat(agent, user_input: str, ctx: TenantContext) -> str:
+    try:
+        result = await Runner.run(agent, user_input, context=ctx)
+    except InputGuardrailTripwireTriggered as exc:
+        info = exc.guardrail_result.output.output_info
+        log.warning("input blocked", extra={"guardrail": exc.guardrail_result.guardrail.get_name(), "info": info})
+        return "这个问题超出了我的服务范围，我可以帮你查询订单、退款和物流。"
+    except OutputGuardrailTripwireTriggered as exc:
+        log.error("output blocked", extra={"guardrail": exc.guardrail_result.guardrail.get_name()})
+        return "抱歉，这条回复未通过安全检查，已转人工处理。"
+    return result.final_output.response
+
+
+async def main():
+    ctx = TenantContext(tenant_id="T-1001", plan="free")
+    print(await chat(agent, "你们的竞品价格是多少？", ctx))
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.WARNING)
+    asyncio.run(main())
 ```
 
-预期结果是：免费租户输入里出现"竞品"就 trip，其余情况放行。这段代码验证的是最小可用护栏，一个同步或异步函数，接收上下文、Agent、输入，返回判定结果。实现上有三条要点：
+把这个脚本存成 `guardrail_demo.py`，放在 SDK 根目录 `openai-agents-python/` 下。按第2章配好 key 与模型名后运行它：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python guardrail_demo.py
+```
+
+预期输出是一行引导话术：`这个问题超出了我的服务范围，我可以帮你查询订单、退款和物流。` 标准错误里还会有一条 `input blocked` 的 warning，带上护栏名和 `output_info`。看到这行话术，说明"护栏定义 → trip → 异常 → 话术"这条链已经通了。
+
+这里有一点要留意：`chat` 最后一行返回 `result.final_output.response`，因为 `agent` 设了 `output_type=Reply`，正常路径拿到的 `final_output` 是 `Reply` 实例； demo 中这条路径不会被走到，但写代码时要按 `output_type` 取对应字段。
+
+> 提示：`input_guardrail` / `output_guardrail` 从 `agents` 顶层也能导入。本课程统一用 `agents.decorators`，与工具装饰器保持一致。
+
+下面这段拦截免费租户的竞品咨询，验证最小可用护栏的写法。它对应主线脚本里的 `block_competitor_queries`，是片段，不是完整脚本，嵌在主线脚本的护栏定义处，前置的 import 和 `TenantContext` 都在脚本顶部。实现上有三条要点：
+
+```python
+@input_guardrail(name="block_competitor_queries")
+async def block_competitor_queries(
+    ctx: RunContextWrapper[TenantContext],
+    agent: Agent,
+    user_input: str | list[TResponseInputItem],
+) -> GuardrailFunctionOutput:
+    text = user_input if isinstance(user_input, str) else str(user_input)
+    hit = "竞品" in text and ctx.context.plan == "free"
+    return GuardrailFunctionOutput(
+        output_info={"matched_keyword": "竞品", "tenant_id": ctx.context.tenant_id},
+        tripwire_triggered=hit,
+    )
+```
 
 | 要点 | 说明 |
 | --- | --- |
 | 参数顺序 | 第一个参数是 `RunContextWrapper`，第二是**当前要运行的 Agent**，第三才是输入。这个顺序和"直觉上的 (input, agent)"相反，写反了不会报错，只会在运行时拿到奇怪的值。 |
 | 输入类型 | 可能是 `str`，也可能是 `list[TResponseInputItem]`（多轮对话时就是一串 item），所以要按类型分支。 |
 | `output_info` | 是任意对象，用来给日志、追踪、前端展示留证据，运行器不解释它。 |
-
-> 提示：`input_guardrail` / `output_guardrail` 从 `agents` 顶层也能导入。本课程统一用 `agents.decorators`，与工具装饰器保持一致。
 
 ## 两种护栏，两种签名
 
@@ -85,15 +205,9 @@ async def block_competitor_queries(
 
 输出护栏拿到的 `agent_output` 已经是运行器解析后的对象。如果 Agent 配了 `output_type=MessageOutput`，那这里就是 `MessageOutput` 实例。你可以直接读字段，不必再解析 JSON。这是输出护栏比"字符串正则"强大得多的地方。
 
-下面的输出护栏在回复里查手机号片段，验证"拿到的已经是结构化对象"。
+下面这段输出护栏在回复里查手机号片段，验证"拿到的已经是结构化对象"。它是片段，不是完整脚本，对应主线脚本里的 `no_phone` 和 `Reply`，前置的 `BaseModel`、`Field` import 在脚本顶部。
 
 ```python
-from pydantic import BaseModel, Field
-
-from agents import Agent, GuardrailFunctionOutput
-from agents.decorators import output_guardrail
-
-
 class Reply(BaseModel):
     reasoning: str = Field(description="内部推理，不给用户看")
     response: str = Field(description="给用户看的回复")
@@ -106,9 +220,6 @@ async def no_phone(ctx, agent: Agent, output: Reply) -> GuardrailFunctionOutput:
         output_info={"in_response": "650" in output.response, "in_reasoning": "650" in output.reasoning},
         tripwire_triggered=leaked,
     )
-
-
-agent = Agent(name="客服", instructions="回答客户问题。", output_type=Reply, output_guardrails=[no_phone])
 ```
 
 预期结果是：`response` 或 `reasoning` 里出现 `650` 就 trip。注意这里同时检查了两个字段。真实事故里，敏感信息更常出现在"推理字段"里，然后被前端一起渲染出去。
@@ -152,6 +263,8 @@ agent = Agent(name="客服", instructions="回答客户问题。", output_type=R
 
 阻断模式下还有一处更细的保护。如果这个 Agent 跑在沙箱里，阻断型护栏会在**沙箱准备之前**执行，避免 trip 之后还创建或修改了沙箱会话。
 
+可选微调：主线脚本的 `block_competitor_queries` 用的是默认并行模式，会启动一次模型调用。若你只想验证拦截逻辑、不想花 token，把它改成 `@input_guardrail(name="block_competitor_queries", run_in_parallel=False)`，trip 时模型一次都不会启动。这条微调不影响主线其余部分。
+
 ## 抓住 tripwire：异常、证据与话术
 
 护栏触发不是"返回值"，而是异常。两类异常都带 `guardrail_result` 字段：
@@ -165,16 +278,9 @@ agent = Agent(name="客服", instructions="回答客户问题。", output_type=R
 
 实际产品里，异常处理就是话术层。要点是：**对用户说人话，对日志说真话**。
 
-下面这段把两类异常分别接住，验证拦截时该返回什么话术。
+下面这段把两类异常分别接住，验证拦截时该返回什么话术。它是片段，不是完整脚本，对应主线脚本里的 `chat` 函数，前置的 import、`log`、异常类都在脚本顶部。
 
 ```python
-import logging
-
-from agents import InputGuardrailTripwireTriggered, OutputGuardrailTripwireTriggered, Runner
-
-log = logging.getLogger(__name__)
-
-
 async def chat(agent, user_input: str) -> str:
     try:
         result = await Runner.run(agent, user_input)
@@ -200,7 +306,7 @@ async def chat(agent, user_input: str) -> str:
 
 有些规则属于整条业务线，这时用 `RunConfig` 挂全局护栏最省事。Agent 级护栏适合"这个 Agent 的特性"，但"所有出口都必须过合规词库"这类规则，是整条业务线共用的。
 
-下面把两个护栏挂到 `RunConfig`，验证全局兜底的写法。
+下面把两个护栏挂到 `RunConfig`，验证全局兜底的写法。它是片段，不是完整脚本：把它嵌进主线脚本的 `main` 里，替换 `Runner.run` 那一行的参数；前置的 `block_competitor_queries`、`no_phone`、`agent` 都来自主线脚本。
 
 ```python
 from agents import RunConfig, Runner
@@ -220,7 +326,7 @@ result = await Runner.run(agent, "帮我写份竞品分析", run_config=run_conf
 
 当 `tool_use_behavior` 让某个函数工具的结果直接成为最终输出，而输出护栏把这个结果否掉时，SDK 需要在会话历史、`RunState`、流式结果里保留一条"可重放的"记录。
 
-它保留的不是原始输出，而是占位文本，默认是 `"Output withheld by an output guardrail."`。你可以传一个非空字符串或一个**同步**格式化函数来替换它：
+它保留的不是原始输出，而是占位文本，默认是 `"Output withheld by an output guardrail."`。你可以传一个非空字符串或一个**同步**格式化函数来替换它。下面这段是片段，不是完整脚本，嵌在入口脚本里、任何模型调用之前，前置的 import 已写在片段内。
 
 ```python
 from agents import OutputGuardrailBlockedMessageArgs, RunConfig
@@ -243,11 +349,13 @@ run_config = RunConfig(output_guardrail_blocked_message=blocked_message)
 
 ## 三类实战护栏
 
+主线演示的是"关键词 + 结构化输出"两种最省钱的护栏。下面三类是真实业务里的常见形态，作为可选微调按需取用，不影响主线跑通。
+
 ### 一、相关性过滤：这个 Agent 该不该接这个活
 
 客服 Agent 只该处理订单、退款、物流，别的话题不该花大模型的钱。用户问"帮我写首诗"，正确行为是直接引导，不调用主模型。
 
-下面的护栏先用小模型判话题，再决定是否 trip，验证"便宜拦截"的思路。
+下面的护栏先用小模型判话题，再决定是否 trip，验证"便宜拦截"的思路。它是片段，不是完整脚本：整段（含 `Topic`、`TopicVerdict`、`router_agent`、`topic_guardrail`）嵌到主线脚本的护栏定义区，`Agent`、`GuardrailFunctionOutput`、`Runner`、`input_guardrail` 等 import 在脚本顶部已备好。
 
 ```python
 from enum import Enum
@@ -297,7 +405,7 @@ async def topic_guardrail(ctx, agent, user_input) -> GuardrailFunctionOutput:
 
 这类判定天然需要语义理解，所以仍然用一个小模型分类，但要阻断模式。
 
-下面用一个判定 Agent 分类输入，验证注入检测的写法。
+下面用一个判定 Agent 分类输入，验证注入检测的写法。它是片段，不是完整脚本：整段嵌到主线脚本的护栏定义区，`BaseModel`、`Agent`、`GuardrailFunctionOutput`、`Runner`、`input_guardrail` 等 import 在脚本顶部已备好。
 
 ```python
 from pydantic import BaseModel
@@ -374,35 +482,35 @@ async def injection_guardrail(ctx, agent, user_input) -> GuardrailFunctionOutput
 
 ## 常见坑与排查
 
-**症状：交接给子 Agent 后，输入护栏"失效"了。**
-原因：输入护栏只对链条第一个 Agent 生效，这是设计而非 bug。修法：把规则挂到 `RunConfig.input_guardrails` 做全局兜底，或改用工具护栏覆盖中途步骤。
+按症状查，每条都给出"症状 / 原因 / 修法"。
 
-**症状：护栏 trip 了，但工具已经执行、订单已经取消。**
-原因：用了默认的并行模式，trip 判定晚于工具执行。修法：该护栏改 `run_in_parallel=False`；对有副作用的 Agent 一律用阻断模式。
+1. **症状：交接给子 Agent 后，输入护栏"失效"了。** 原因：输入护栏只对链条第一个 Agent 生效，这是设计而非 bug。修法：把规则挂到 `RunConfig.input_guardrails` 做全局兜底，或改用工具护栏覆盖中途步骤。
 
-**症状：`TypeError: 'GuardrailFunctionOutput' object is not callable` 或判定永远为假。**
-原因：护栏函数返回了 `GuardrailFunctionOutput` 之外的形状，或把 `tripwire_triggered` 写成了字符串 `"false"`（真值恒为真）。修法：返回类型标注写全，布尔值显式转换。
+2. **症状：护栏 trip 了，但工具已经执行、订单已经取消。** 原因：用了默认的并行模式，trip 判定晚于工具执行。修法：该护栏改 `run_in_parallel=False`；对有副作用的 Agent 一律用阻断模式。
 
-**症状：输出护栏 trip 后，会话历史里出现了奇怪的占位文本。**
-原因：终端函数工具输出被输出护栏拒绝，SDK 用占位文本替换以保证可重放。修法：这是预期行为；要定制文案就设 `RunConfig.output_guardrail_blocked_message`，但不要指望它保留原文。
+3. **症状：`TypeError: 'GuardrailFunctionOutput' object is not callable` 或判定永远为假。** 原因：护栏函数返回了 `GuardrailFunctionOutput` 之外的形状，或把 `tripwire_triggered` 写成了字符串 `"false"`（真值恒为真）。修法：返回类型标注写全，布尔值显式转换。
 
-**症状：给 `output_guardrail` 传了 `run_in_parallel=False` 报类型错误。**
-原因：`OutputGuardrail` 没有这个字段，输出护栏在 Agent 完成后才跑，天然不并行。修法：删掉该参数。
+4. **症状：输出护栏 trip 后，会话历史里出现了奇怪的占位文本。** 原因：终端函数工具输出被输出护栏拒绝，SDK 用占位文本替换以保证可重放。修法：这是预期行为；要定制文案就设 `RunConfig.output_guardrail_blocked_message`，但不要指望它保留原文。
 
-**症状：护栏里再调 `Runner.run` 时上下文丢字段。**
-原因：忘了把 `ctx.context` 透传进去。修法：护栏内所有子调用都写 `context=ctx.context`。
+5. **症状：给 `output_guardrail` 传了 `run_in_parallel=False` 报类型错误。** 原因：`OutputGuardrail` 没有这个字段，输出护栏在 Agent 完成后才跑，天然不并行。修法：删掉该参数。
+
+6. **症状：护栏里再调 `Runner.run` 时上下文丢字段。** 原因：忘了把 `ctx.context` 透传进去。修法：护栏内所有子调用都写 `context=ctx.context`。
 
 ## 动手练习
 
-1. **基础**：为第 7 章的天气工具 Agent 加一个输入护栏，当用户输入里出现"忽略以上指令"时 trip，并用 `run_in_parallel=False` 观察它与默认模式的区别（可在护栏里 `await asyncio.sleep(0.5)` 放大差异）。
-2. **进阶**：把本章的 PII 检查拆成"输入侧护栏（发现身份证号就 trip）+ 输出侧护栏（发现手机号就 trip）"，并写一个包装函数，在 trip 时统一返回带 `工单号` 的安抚话术。
-3. **改仓库**：打开 `examples/agent_patterns/input_guardrails.py`，在现有数学作业护栏之外再加一个"话题相关性"护栏（复用本章 `router_agent`），让它在并行模式下运行。再修改示例中的 `except` 分支，把两个护栏的 `output_info` 都打印出来，观察 `run_data` 里的累计结果。
+1. **基础（立刻可做）**：把主线的 `guardrail_demo.py` 跑起来，确认屏幕输出引导话术、日志有 `input blocked`。然后把 `plan` 改成 `"paid"` 再跑一次，观察这次不再 trip，输入进入模型。
+
+2. **加强**：为第 7 章的天气工具 Agent 加一个输入护栏，当用户输入里出现"忽略以上指令"时 trip，并用 `run_in_parallel=False` 观察它与默认模式的区别（可在护栏里 `await asyncio.sleep(0.5)` 放大差异）。
+
+3. **进阶**：把本章的 PII 检查拆成"输入侧护栏（发现身份证号就 trip）+ 输出侧护栏（发现手机号就 trip）"，并写一个包装函数，在 trip 时统一返回带 `工单号` 的安抚话术。
+
+4. **改仓库**：打开 `examples/agent_patterns/input_guardrails.py`，在现有数学作业护栏之外再加一个"话题相关性"护栏（复用本章 `router_agent`），让它在并行模式下运行。再修改示例中的 `except` 分支，把两个护栏的 `output_info` 都打印出来，观察 `run_data` 里的累计结果。
 
 跑这个示例前，先站到 SDK 根目录：
 
 ```bash
-# 工作目录：repo/openai-agents-python/（SDK 根目录）
-cd repo/openai-agents-python
+# 工作目录：openai-agents-python/（SDK 根目录）
+cd openai-agents-python
 python examples/agent_patterns/input_guardrails.py
 ```
 
@@ -412,10 +520,9 @@ python examples/agent_patterns/input_guardrails.py
 
 - 护栏返回 `GuardrailFunctionOutput(output_info, tripwire_triggered)`；trip 是异常，不是返回值。
 - 输入护栏签名 `(context, agent, input)`，只对链条第一个 Agent 生效；输出护栏签名 `(context, agent, agent_output)`，只在最终输出上生效。
-- 输入护栏默认并行（省延迟、可能白花钱），`run_in_parallel=False` 阻断（省钱、防副作用）。
-- trip 会取消在途模型任务与兄弟护栏任务，但无法撤销已经发生的副作用。
-- `RunConfig.input_guardrails` / `output_guardrails` 是**追加**而非替换；`output_guardrail_blocked_message` 定制的是被拒绝终端工具输出的占位文案。
-- 护栏只能判定，不能改写；脱敏要么用工具输出护栏替换，要么在应用层后处理。
+- 输入护栏默认并行（省延迟、可能白花钱），`run_in_parallel=False` 阻断（省钱、防副作用）；取消拦不住已发生的副作用。
+- `RunConfig` 的 `input_guardrails` / `output_guardrails` 是**追加**而非替换；`output_guardrail_blocked_message` 定制的是被拒绝终端工具输出的占位文案。
+- 护栏只能判定、不能改写；脱敏要么用工具输出护栏替换，要么在应用层后处理。
 - 成本排序：正则 → 小模型分类 → 大模型评审；先用零成本手段挡住大部分流量。
 
 ## 延伸阅读

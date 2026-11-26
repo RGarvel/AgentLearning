@@ -4,14 +4,16 @@
 
 这一章讲另一种答案：**把音频帧直接喂给模型，模型直接吐音频**，中间的文本只作为副产物存在。
 
-本章解决的真实问题：什么场景该放弃三段式、改用端到端；改用之后工具、handoff、护栏、打断还剩多少；以及这套东西在你的服务端怎么摆。读完你会拿到一张取舍表、一套最小闭环，和三条不能踩的硬限制。
+本章解决的真实问题：什么场景该放弃三段式、改用端到端（speech-to-speech）；改用之后工具、handoff、护栏、打断还剩多少；以及这套东西在你的服务端怎么摆。读完你会拿到一张取舍表、一套最小闭环，和三条不能踩的硬限制。
+
+这一章只给一条主线：装好 SDK、配齐 API key 与 WebSocket 端点，用文本输入跑通一个 `RealtimeAgent` + `RealtimeRunner` + `RealtimeSession` 的最小闭环。SIP attach、Azure 换端点、自定义 transport 都降级为"可选微调"，放在主线之后。
 
 ---
 
 ## 学习目标
 
 - 能说清 realtime（端到端 speech-to-speech）与 VoicePipeline（三段式）的取舍边界，并给出选择理由。
-- 能写出 RealtimeAgent + RealtimeRunner + RealtimeSession 的最小闭环，并说明为什么必须先 `async with`。
+- 能配齐 API key 与 WebSocket 端点，写出 RealtimeAgent + RealtimeRunner + RealtimeSession 的最小闭环，并说明为什么必须先 `async with`。
 - 能读懂 RealtimeRunConfig 的 model_settings 嵌套结构（audio.input / audio.output），知道旧扁平字段为什么不该再用。
 - 能列出 realtime 下 handoff 与 guardrails 的三条硬限制，并解释 `guardrail_tripped` 的恢复流程。
 - 能画出浏览器 / 服务端 / SIP 三种部署拓扑，并指出为什么浏览器不能直连。
@@ -37,7 +39,7 @@
 
 还有一个差别容易被忽略：**三段式的每一步都是可缓存的**。同样的转写文本可以复用 Agent 的 session，也可以只重跑 TTS。端到端则是一条长连接上的连续上下文，很难"只重放后半段"。所以做评测（第 23 章）时，三段式更容易构造确定性用例。
 
-判断口径很简单。**业务逻辑必须"先想清楚再说话"（查库、算价、走审批），三段式更容易控；核心体验是"像打电话一样自然"，选 realtime。**两者并不互斥，不少生产系统用 realtime 做前台，用三段式的思路在工具里做重活。
+判断口径很简单。**业务逻辑必须"先想清楚再说话"（查库、算价、走审批），三段式更容易控；核心体验是"像打电话一样自然"，选 realtime。** 两者并不互斥，不少生产系统用 realtime 做前台，用三段式的思路在工具里做重活。
 
 ---
 
@@ -64,7 +66,30 @@
 
 **跑通最小闭环只需要一个 RealtimeAgent 加一个会话。**
 
-下面这段验证三件事：会话怎么进、事件怎么消费、`async with` 该套在谁身上。为了让链路先跑通，输入用文本而不是麦克风：
+先把配置项一次配齐。realtime 走 WebSocket 长连接，端点、鉴权、模型名缺一项都连不上或说不出话。
+
+| 配置项 | 怎么设 | 漏了会报什么错 |
+| --- | --- | --- |
+| SDK 与 websockets | `uv pip install -e .`；websockets 已是核心依赖，不用额外装 `[realtime]` | 缺 websockets 报 `ModuleNotFoundError: websockets` |
+| API Key | `export OPENAI_API_KEY=sk-...`，Windows 用 `$env:OPENAI_API_KEY = "sk-..."` | 连接建立后被 401 鉴权失败拒绝 |
+| WebSocket 端点 | 官方默认 `wss://api.openai.com/v1/realtime`；网关设 `OPENAI_WEBSOCKET_BASE_URL`，协议用 `wss://` | 网关没设就一直连官方地址，报 404 或 `Invalid URL` |
+| 模型名 | 放在 `model_settings.model_name`，如 `gpt-realtime-2.1`；`RealtimeAgent` 没有 `model` 字段 | 写错或网关不支持报 model not found |
+| `async with` 写法 | 必须 `async with await runner.run() as session:` | 漏 `await` 报 `TypeError: 'coroutine' object does not support the asynchronous context manager protocol` |
+| Azure 换端点 / 换鉴权 | `model_config={"url": "...", "headers": {"api-key": "<key>"}}` | 用默认 url 连不上 Azure；传了 headers 就不再自动加 Authorization，漏传报 401 |
+| 轮次检测 | `audio.input.turn_detection`；设成 `None` 就关掉自动检测 | 设 None 后模型永远不回复，得自己发 commit 和 response.create |
+
+课程正文里的 `repo/src/agents/realtime/session.py` 点开是 v0.25.0 的源码。本机 SDK 目录叫 `openai-agents-python/`，对照如下：
+
+| 课程里写的（可点击） | 你本机打开的文件 |
+| --- | --- |
+| `repo/examples/realtime/app/server.py` | `openai-agents-python/examples/realtime/app/server.py` |
+| `repo/src/agents/realtime/session.py` | `openai-agents-python/src/agents/realtime/session.py` |
+
+若你的 clone 在别处，把命令里的 `openai-agents-python` 换成自己的路径即可，后文不再重复。
+
+### 主线：跑通一个最小闭环
+
+先装 SDK，再跑下面的脚本。为了让链路先跑通，输入用文本而不是麦克风。下面这段验证三件事：会话怎么进、事件怎么消费、`async with` 该套在谁身上。把它存成 `realtime_min.py`，放在 SDK 根目录 `openai-agents-python/` 下：
 
 ```python
 import asyncio
@@ -84,6 +109,19 @@ agent = RealtimeAgent(
     instructions="你是电话前台。回答简短口语化，需要查天气时调用工具。",
     tools=[get_weather],
 )
+
+
+class Player:
+    def flush(self) -> None:
+        print("player flush")
+
+
+player = Player()
+
+
+def play(data: bytes) -> None:
+    # 换成 sounddevice 的 OutputStream.write 即可听到声音
+    print("audio bytes:", len(data))
 
 
 async def main() -> None:
@@ -112,15 +150,15 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-预期结果：事件顺序是 `agent_start` → `tool_start`（打印"调用工具: get_weather"）→ `tool_end` → 若干 `audio` → `audio_end`。
-
-跑之前先把 SDK 装好。若你的 clone 在别的目录，按自己的路径替换 `cd` 后面那段：
+运行它：
 
 ```bash
-# 工作目录：repo/openai-agents-python/（SDK 根目录）
-cd repo/openai-agents-python
+# 工作目录：openai-agents-python/（SDK 根目录）
 uv pip install -e .
+python realtime_min.py
 ```
+
+预期结果：事件顺序是 `agent_start` → `tool_start`（打印"调用工具: get_weather"）→ `tool_end` → 若干 `audio` → `audio_end`，音频块以 `audio bytes: N` 的形式打印。想听声音，把 `play()` 换成 `sounddevice` 的输出流；麦克风输入则把 `send_message` 换成 `send_audio`。
 
 三个必须记住的点：
 
@@ -141,7 +179,7 @@ uv pip install -e .
 | 运行级 | `RealtimeRunner(config={...})` | `model_settings`、`output_guardrails`、`guardrails_settings`、`async_tool_calls`、`tool_execution`、`tool_error_formatter`、`tracing_disabled` |
 | 会话/模型级 | `model_settings` 里面（或 `runner.run(model_config=...)` 的 `initial_model_settings`） | 模型名、音频输入输出、轮次检测、转写、声音、工具选择 |
 
-`model_settings` 里最值钱的是嵌套的 `audio`。下面这段验证嵌套结构与几个常用键：
+`model_settings` 里最值钱的是嵌套的 `audio`。下面这段验证嵌套结构与几个常用键。**这是片段，不是完整脚本**：把它替换进第三节 `main()` 里 `runner = RealtimeRunner(starting_agent=agent)` 那一行；`agent` 来自第三节创建的那个 `RealtimeAgent`：
 
 ```python
 runner = RealtimeRunner(
@@ -203,9 +241,9 @@ runner = RealtimeRunner(
 
 ## 六、handoff 与 guardrails 的三条硬限制
 
-**realtime 下的 handoff 与护栏有三条硬限制，写代码前得先知道。**
+**realtime 下的 handoff 与护栏（guardrail）有三条硬限制，写代码前得先知道。**
 
-**限制一：handoff 没有 `input_filter`。**`RealtimeAgent` 直接放进 `handoffs` 会被自动包装；想定制名字、描述、可用性就用 `realtime_handoff(...)`。下面这段验证包装写法：
+**限制一：handoff 没有 `input_filter`。**`RealtimeAgent` 直接放进 `handoffs` 会被自动包装；想定制名字、描述、可用性就用 `realtime_handoff(...)`。下面这段验证包装写法。**这是片段，不是完整脚本**：把这两个 Agent 定义放到第三节 `agent` 的位置，作为 `starting_agent` 传给 `RealtimeRunner`：
 
 ```python
 from agents.realtime import RealtimeAgent, realtime_handoff
@@ -223,6 +261,8 @@ front = RealtimeAgent(
 **限制二：没有用户输入护栏。**`RealtimeAgent` 只有 `output_guardrails` 字段，输入侧只有**工具**的输入护栏。想拦截用户说的话，只能自己在 `send_message` / `send_audio` 之前做，或者干脆把敏感动作放进工具里守。
 
 **限制三：护栏命中不抛异常，而是走恢复流程。**输出护栏是**去抖**执行的，每累积 `debounce_text_length`（默认 100）字符才检查一次，不会对每个 delta 都跑。命中后 SDK 依次做三件事：取消当前响应、发 `guardrail_tripped`、追加一条点名该护栏的用户消息，让模型重新生成。
+
+下面这段验证护栏怎么挂。**这是片段，不是完整脚本**：把它放到第三节 `agent` 定义的位置，替换掉原来的 `agent = RealtimeAgent(...)`：
 
 ```python
 from agents.guardrail import GuardrailFunctionOutput, OutputGuardrail
@@ -252,7 +292,7 @@ agent = RealtimeAgent(
 
 **打断要"服务端判、本地停"，两件事都得做对，缺一半都会出问题。**
 
-打断是 realtime 最值钱的能力，也是最多人做错的地方。四个要点：
+打断（barge-in）是 realtime 最值钱的能力，也是最多人做错的地方。四个要点：
 
 | 要点 | 说明 |
 | --- | --- |
@@ -274,7 +314,7 @@ agent = RealtimeAgent(
 
 浏览器 WebRTC 不在这个 SDK 里。最常见的错误拓扑是"浏览器直连 OpenAI 并带上 API key"，那等于把密钥发到每个用户的浏览器。
 
-下面这段验证两件事：自定义 transport 参数，以及换端点、换鉴权：
+下面这段验证两件事：自定义 transport 参数，以及换端点、换鉴权。**这是片段，不是完整脚本**：`agent` 来自第三节；把它放进 `async def main()` 里，替换第三节的 `runner = RealtimeRunner(starting_agent=agent)` 与 `runner.run()` 两行，片段末尾的 `session` 接着用 `async for event in session` 消费：
 
 ```python
 from agents.realtime import OpenAIRealtimeWebSocketModel, RealtimeRunner
@@ -302,6 +342,8 @@ session = await runner.run(
 
 ## 常见坑与排查
 
+**realtime 故障按症状查，下面六条都给出"症状 → 原因 → 修法"。**
+
 1. **`TypeError: 'coroutine' object does not support the asynchronous context manager protocol`**
    原因：写成了 `async with runner.run() as session`。修法：改成 `async with await runner.run() as session`，或先 `await` 再 `enter()`。
 
@@ -324,6 +366,8 @@ session = await runner.run(
 
 ## 动手练习
 
+**三道练习从文本先行到改造示例，第一道现在就能做。**
+
 1. **文本先行**：用第三节骨架，只发 `send_message`，把全事件打到控制台。确认顺序是 `agent_start → tool_start → tool_end → agent_end`，并找出 `history_updated` 出现在哪。
 2. **关掉自动轮次检测**：把 `turn_detection` 设为 `None`，手动用 `send_audio(..., commit=True)` 提交一轮，再发 `response.create`，体会"手动控制"和"自动 VAD"的差别。
 3. **改造示例**：打开 `repo/examples/realtime/cli/demo.py`，把"助手播报时用 RMS 门限做 barge-in"那段（`capture_audio` 里的 `ENERGY_THRESHOLD` 逻辑）换成"只按 `audio_interrupted` 事件驱动"，对比哪种在扬声器外放时误触发更少。
@@ -331,6 +375,8 @@ session = await runner.run(
 ---
 
 ## 本章小结
+
+**这一章的结论压成六条：**
 
 - 端到端 realtime 换掉的是"中间那层文本"，换来更低延迟和内建打断，代价是可插入逻辑与可观测性；浏览器不能直连，服务端 WebSocket 或 SIP attach 才是 SDK 支持的拓扑。
 - 四个对象：`RealtimeAgent`（窄）、`RealtimeRunner`（工厂）、`RealtimeSession`（活会话）、`RealtimeModel`（传输）。
@@ -342,6 +388,8 @@ session = await runner.run(
 ---
 
 ## 延伸阅读
+
+**按下面的顺序查资料，最后一条指向下一章。**
 
 - 指南与生命周期：`repo/docs/realtime/guide.md`
 - 传输选型：`repo/docs/realtime/transport.md`

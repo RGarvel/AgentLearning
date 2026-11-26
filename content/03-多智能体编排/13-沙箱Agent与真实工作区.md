@@ -4,7 +4,11 @@
 
 当任务变成"把一个真实仓库拉下来、装依赖、跑测试、改代码、产出 patch"时，进程内的工具就不够了。你需要一块**可以被弄脏、可以被丢弃、可以被快照恢复**的工作区。
 
-这正是 `SandboxAgent` 要解决的问题。本章回答三件事：什么时候该把 Agent 放进沙箱（sandbox）、怎么声明它的工作区、怎么选后端并把成本与隔离控制在可接受范围内。
+这正是沙箱（sandbox）要解决的问题，也就是 `SandboxAgent`。本章只有一条主线：把第六节的 code review 最小脚本跑通。换后端、加技能、改历史策略都是可选微调，放在主线之后。
+
+按这章走完，你会得到一个能产出 `review.md` 与 `findings.jsonl` 的脚本，以及一张"漏了哪项配置会报什么错"的对照表。
+
+---
 
 ## 学习目标
 
@@ -12,7 +16,9 @@
 - 能用 `Manifest` 声明一份"新鲜沙箱"的工作区契约，并知道它什么时候不生效。
 - 能列举 `Shell`、`Filesystem`、`Skills`、`Memory`、`Compaction` 五个内置 capability 各自注入什么工具、有什么前置依赖。
 - 能根据隔离需求、宿主环境、预算在 Unix-local / Docker / 托管后端之间做出选择并说明理由。
-- 能写出一个"给仓库做 code review"的最小脚本，并知道怎么从快照或 session state 恢复上一次的工作区。
+- 能跑通一个"给仓库做 code review"的最小脚本，并知道怎么从快照或 session state 恢复上一次的工作区。
+
+---
 
 ## 一、SandboxAgent 只是换了执行边界
 
@@ -47,9 +53,49 @@
 
 > 注意：沙箱不改变"轮次（turn）"的含义。一个 turn 仍是一次模型步进，不是一条 shell 命令。别指望"跑了 5 条命令 = 5 个 turn"。
 
+### 主线路径与配置对照表
+
+课程正文里的 `repo/xxx` 是逻辑前缀，点击跳 GitHub；本机 SDK 根目录是 `openai-agents-python/`。两者对照如下：
+
+| 课程里写的（可点击） | 你本机打开的文件 |
+| --- | --- |
+| `repo/examples/sandbox/tutorials/repo_code_review/main.py` | `openai-agents-python/examples/sandbox/tutorials/repo_code_review/main.py` |
+| `repo/docs/sandbox/guide.md` | `openai-agents-python/docs/sandbox/guide.md` |
+
+如果你的源码 clone 在别处，把命令里的 `openai-agents-python` 换成自己的路径即可，后文不再重复。
+
+第六节那条主线要跑通，下面每一项都得对。表里同时写了漏了或设错会看到什么。
+
+| 配置项 | 怎么设 | 漏了/设错会报什么错 |
+| --- | --- | --- |
+| 本机 SDK 根目录 | `openai-agents-python/` | 命令报 `python: can't open file` |
+| 工作目录 | 主脚本不设 `cwd`，相对路径从工作区根算起 | patch 路径按 shell 的 `workdir` 写会找不到文件（坑 2） |
+| `SandboxRunConfig.cwd` | 可选，设 `"repo"` 把解析起点挪进仓库 | 它只改起点，不是牢笼，不限制其他被允许路径 |
+| `Manifest.root` | 默认 `/workspace` | 条目路径算错，工作区内容与预期对不上 |
+| 条目路径 | 工作区相对，不能绝对、不能 `..` | 构建 manifest 时就直接报错 |
+| `LocalFile.src` / `LocalDir.src` | 相对 SDK 进程工作目录，源必须在其下 | 找不到源文件或被拒绝，除非 `extra_path_grants` 覆盖 |
+| `GitRepo` 的 `git` | Unix-local 宿主装；Docker/托管镜像装 | clone 阶段失败（坑 6） |
+| `GitRepo.ref` | 钉具体 commit，如 `621e4974ca25ce531773def586ba3ed8e736b3fc` | 不报错，但同一问题明天可能得出不同结论 |
+| `capabilities` | 主脚本写 `[Shell(), Filesystem()]` | 写 `[Shell()]` 就改不了文件（坑 3） |
+| `Shell` | 跑测试、装依赖必须有 | 模型没有 `exec_command` 工具 |
+| `Filesystem` | 改文件、看图必须有 | 模型没有 `apply_patch` / `view_image` |
+| 允许的命令 | `exec_command` 在沙箱内执行；主脚本跑 `python -m unittest discover -s tests` | 缺 `Shell` 时无工具可用；沙箱里没有 python 或测试依赖时命令本身失败 |
+| `extra_path_grants` | 显式绝对路径，`read_only=True` 可只读 | 访问工作区外路径被拒；`host_path` 在 Unix-local 被拒 |
+| `network_mode="none"` | Docker 断网时显式设 | 容器仍有网络；设了以后不能再暴露端口 |
+| Docker 镜像 | `python:3.14-slim`，镜像里要有 git 与运行时 | 启动或物化阶段失败 |
+| `client` / `session` / `session_state` / `snapshot` | SDK 托管传 `client`；复用传 `session` | 混用会冲突；不传则按默认新建会话 |
+| `workflow_name` | `"repo-code-review"` | 不报错，但 trace 不好找 |
+| 模型名 | `model="gpt-5.6-sol"` | 网关场景沿用默认会报 `model not found` |
+| `output_type` | `output_type=ReviewReport` | `final_output_as(ReviewReport)` 拿不到结构化对象 |
+| 平台 | Unix-local 仅 macOS/Linux；Windows 用 Docker 或托管 | 初始化或启动即失败（坑 5） |
+| API Key | 同第 2 章的 `OPENAI_API_KEY` | 鉴权失败 |
+| 输出目录 | 脚本自己 `mkdir("review-output")` | 不报错，但取不到产物文件 |
+
+---
+
 ## 二、Manifest：新鲜沙箱的工作区契约
 
-`Manifest` 描述的是**新建沙箱会话**时工作区长什么样。
+`Manifest` 描述的是**新建沙箱会话**时工作区长什么样。复用会话、从快照或 `session_state` 恢复时，它不是真相来源。
 
 它包含根目录、条目、环境变量、用户与组，以及工作区之外的额外路径授权。源码里它是一个 Pydantic 模型，字段包括 `root`（默认 `/workspace`）、`entries`、`environment`、`users`、`groups`、`extra_path_grants`。
 
@@ -68,7 +114,7 @@
 2. `LocalFile.src` / `LocalDir.src` 默认相对 **SDK 进程的工作目录**解析，且源必须落在这个目录之下。除非被 `extra_path_grants` 显式覆盖。
 3. `GitRepo` 依赖沙箱内 `PATH` 上的 `git`。装 Python SDK 不会替你装 git：Unix-local 要宿主有 git，Docker/托管要镜像里有 git。
 
-`extra_path_grants` 是"让 Agent 访问工作区之外的具体绝对路径"的唯一正当方式，例如 `/tmp` 或只读的 `/opt/toolchain`：
+`extra_path_grants` 是"让 Agent 访问工作区之外的具体绝对路径"的唯一正当方式，例如 `/tmp` 或只读的 `/opt/toolchain`。
 
 ```python
 from agents.sandbox import Manifest, SandboxPathGrant
@@ -81,9 +127,9 @@ manifest = Manifest(
 )
 ```
 
-预期：两个路径被授权，`/tmp` 可写，`/opt/toolchain` 只读。
+这是片段，不是完整脚本：把它嵌到第六节主脚本的 manifest 定义区，作为 `extra_path_grants` 参数；`Manifest` 与 `SandboxPathGrant` 由片段顶部的 import 提供。
 
-这段要验证的是"授权是显式的、可只读的"。两个细节要记住。
+预期：两个路径被授权，`/tmp` 可写，`/opt/toolchain` 只读。这段要验证的是"授权是显式的、可只读的"。两个细节要记住。
 
 `host_path` 只有 Docker 支持，它把宿主路径映射到容器内另一个 POSIX 路径。Unix-local 只接受同路径授权，并会拒绝 `host_path`。
 
@@ -96,6 +142,8 @@ manifest = Manifest(
 `Permissions` 控制 manifest 物化出来的文件对 owner/group/other 的读写执行位，`run_as` 决定模型侧工具以哪个用户身份执行。
 
 两者都不等于"审批策略"，那是第 15 章的话题。
+
+---
 
 ## 三、capabilities：把沙箱原语装到 Agent 上
 
@@ -121,7 +169,7 @@ capability 是"能改 manifest、能追加指令、能往会话上绑工具"的�
 
 扩展名是图片但内容不是，会被拒绝；内容确实是图片但文件名没扩展名，反而能读。SVG 则保留按扩展名识别的兼容路径。
 
-技能来源有四种写法，选错会得到"技能明明在磁盘上却加载不到"：
+技能来源有四种写法，选错会得到"技能明明在磁盘上却加载不到"。
 
 ```python
 from agents.sandbox.capabilities import Capabilities, LocalDirLazySkillSource, Skills
@@ -132,17 +180,19 @@ capabilities = Capabilities.default() + [
 ]
 ```
 
-预期：模型先看到技能索引，用到哪个才把哪个物化进沙箱。
+这是片段，不是完整脚本：把它嵌到第六节主脚本的 `capabilities=` 参数处；`Capabilities`、`Skills`、`LocalDirLazySkillSource`、`LocalDir` 由片段顶部的 import 提供。
 
-这段要验证的是"懒加载技能"。`LocalDir.src` 指的是 **SDK 宿主进程**上的目录，不是沙箱里的路径。
+预期：模型先看到技能索引，用到哪个才把哪个物化进沙箱。这段要验证的是"懒加载技能"。`LocalDir.src` 指的是 **SDK 宿主进程**上的目录，不是沙箱里的路径。
 
 `lazy_from` 先让模型看到索引，用到哪个再物化到沙箱的 `skills_path`（默认 `.agents`），适合技能目录较大的场景。
 
 技能很小、希望一次性铺好，就用 `Skills(from_=LocalDir(...))`；技能有自己的发布节奏，就用 `Skills(from_=GitRepo(repo=..., ref=...))`。
 
+---
+
 ## 四、选一个 sandbox client
 
-agent 定义不动，换 client 就换执行环境。选型顺序基本是"先本地、再容器、最后托管"：
+默认走 `UnixLocalSandboxClient`，先把主线跑通；其他客户端都是可选微调。agent 定义不动，换 client 就换执行环境。
 
 | client | 安装 | 什么时候选 |
 | --- | --- | --- |
@@ -154,7 +204,7 @@ agent 定义不动，换 client 就换执行环境。选型顺序基本是"先�
 
 > 注意：`UnixLocalSandboxClient` 在 Linux 上**不提供任何 OS 级隔离**，命令就是宿主进程；macOS 上用 `sandbox-exec` 限制文件系统，但不隔离网络。它只适合可信的本地开发。**Windows 上请直接用 Docker 或托管后端**，Unix-local 不支持。凡是命令受不可信输入影响，就必须换 Docker 或托管后端。
 
-切到 Docker 只需要改 run config，镜像里要有 git 和你需要的运行时：
+切到 Docker 只需要改 run config，镜像里要有 git 和你需要的运行时。
 
 ```python
 from docker import from_env as docker_from_env
@@ -174,11 +224,13 @@ run_config = RunConfig(
 )
 ```
 
-预期：同一个 Agent 换到容器里跑，容器内没有网络；`network_mode="none"` 时也不能再暴露端口。
+这是片段，不是完整脚本：把它嵌到第六节主脚本的 `Runner.run` 处，替换原来的 `run_config=` 参数；`DockerSandboxClientOptions` 等由片段顶部的 import 提供。
 
-这段要验证的是"同一 Agent、只换执行后端"。`options` 是 client 专属的创建参数，Docker 和多数托管后端**必须**提供。
+预期：同一个 Agent 换到容器里跑，容器内没有网络；`network_mode="none"` 时也不能再暴露端口。这段要验证的是"同一 Agent、只换执行后端"。
 
-`network_mode` 唯一支持的显式取值是 `"none"`，此时不能再暴露端口。
+`options` 是 client 专属的创建参数，Docker 和多数托管后端**必须**提供。`network_mode` 唯一支持的显式取值是 `"none"`，此时不能再暴露端口。
+
+---
 
 ## 五、会话、快照与断点恢复
 
@@ -194,9 +246,7 @@ run_config = RunConfig(
 
 默认不传 `snapshot` 时，运行时会尝试用本地默认位置。搭不起来就退化成空快照（不持久化）。
 
-生命周期有两种模式。
-
-**SDK 托管**适合一次 run 就结束的沙箱。传 `client`，Runner 负责建、启、跑、存档、删：
+生命周期有两种模式。**SDK 托管**适合一次 run 就结束的沙箱：传 `client`，Runner 负责建、启、跑、存档、删。
 
 ```python
 result = await Runner.run(
@@ -209,9 +259,11 @@ result = await Runner.run(
 )
 ```
 
+这是片段，不是完整脚本：把它嵌到第六节主脚本的 `main()` 里；`agent`、`Runner`、`RunConfig`、`SandboxRunConfig`、`UnixLocalSandboxClient` 都由主脚本提供。
+
 预期：run 结束后沙箱由 Runner 收掉，你不需要手动清理。
 
-**开发者托管**适合要复用、要在 run 之后翻文件、要自己决定何时清理的场景。传 `session`，Runner 只用不管：
+**开发者托管**适合要复用、要在 run 之后翻文件、要自己决定何时清理的场景。传 `session`，Runner 只用不管。
 
 ```python
 client = UnixLocalSandboxClient()
@@ -226,9 +278,9 @@ finally:
     await client.delete(sandbox)              # 资源是你建的，也得你删
 ```
 
-预期：两次 run 落在同一个沙箱里，第二次能看到第一次留下的文件。
+这是片段，不是完整脚本：第六节主脚本已经用了这套"开发者托管"结构，把上面这段和它对照着看即可；`client`、`manifest`、`agent`、`Runner` 都由主脚本提供。
 
-这段要验证的是"一个沙箱跑两次 run"。两个语义差别必须记住。
+预期：两次 run 落在同一个沙箱里，第二次能看到第一次留下的文件。这段要验证的是"一个沙箱跑两次 run"。两个语义差别必须记住。
 
 `stop()` 只把工作区存进快照，**不拆沙箱**；`aclose()` 才是完整清理（跑 pre-stop 钩子、`stop()`、关资源）。
 
@@ -236,21 +288,23 @@ finally:
 
 > 注意：序列化会**剥离凭据**。session state 与 `RunState` 里不含云挂载凭据、`host_path`、容器内凭据暴露确认。恢复时 SDK 只信任你当前传入的 manifest：拓扑不一致就**在沙箱启动前失败**，序列化状态本身永远不授予权限。所以恢复带挂载或 host 授权的会话，必须把可信 manifest（`SandboxRunConfig.manifest` 或 `agent.default_manifest`）一起给上。另外 `VercelSandboxClient` 不支持恢复已挂载的会话。
 
+---
+
 ## 六、最小示例：给仓库做 code review
 
-把上面的零件拼起来。目标是：钉住一个仓库、钉住一个 ref、跑测试、产出结构化评审结论，再把结论落成文件。
+这是本章主线：钉住一个仓库、钉住一个 ref、跑测试、产出结构化评审结论，再把结论落成文件。
 
 这份代码改编自 `repo/examples/sandbox/tutorials/repo_code_review/main.py`，删掉了流式打印和 CLI。想跑原版，先确认工作目录：
 
 ```bash
-# 工作目录：repo/openai-agents-python/（SDK 根目录）
-cd repo/openai-agents-python
+# 工作目录：openai-agents-python/（SDK 根目录）
+cd openai-agents-python
 python examples/sandbox/tutorials/repo_code_review/main.py
 ```
 
-如果你的仓库 clone 在别处（比如目录名就叫 `repo`），把上面的路径换成自己的即可，后文同此。
+预期输出测试摘要与 findings 统计。如果你的源码 clone 在别处，把命令里的 `openai-agents-python` 换成自己的路径即可，后文不再重复。
 
-下面这段是删掉流式与 CLI 之后的版本，用来对照结构。
+下面这段是删掉流式与 CLI 之后的版本。把它存成 `sandbox_review.py`，放在 SDK 根目录 `openai-agents-python/` 下。
 
 ```python
 import asyncio
@@ -339,7 +393,14 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-预期：终端打印测试摘要和 `wrote N findings to review-output`，并在 `review-output/` 下写出 `review.md` 与 `findings.jsonl`。
+运行它：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python sandbox_review.py
+```
+
+预期：终端打印测试摘要和 `wrote N findings to review-output`，并在 `review-output/` 下写出 `review.md` 与 `findings.jsonl`。看到这两个文件，就是本章的总验收点。
 
 这段要验证的是"沙箱 + 结构化产出 + 事后取文件"这条完整链路。四个关键行值得单独说：
 
@@ -350,11 +411,13 @@ if __name__ == "__main__":
 
 ### 换成 Docker 或加一个只读评审员
 
-换后端只需要改 run config。
+这两项都是主线之后的可选微调。换后端只需要改 run config。
 
 如果想让"评审员"和"修改员"各自有独立工作区，典型做法是给每个 `Agent.as_tool(...)` 传各自的 `run_config=RunConfig(sandbox=SandboxRunConfig(client=..., options=...))`。
 
 如果想让它们看同一个工作区但权限不同，就共享一个 `session` 并用 `run_as` 区分用户（`repo/examples/sandbox/sandbox_agents_as_tools.py`、`repo/examples/sandbox/shared_session_workdirs.py`）。
+
+---
 
 ## 七、边界：什么时候不该用沙箱
 
@@ -385,7 +448,11 @@ Unix-local 在 Linux 上就是宿主进程。工作区目录、`HOME`、`cwd` �
 
 真正需要隔离时，用配置正确的 Docker（`network_mode="none"`、只挂必要的目录、非 root 用户）或托管后端。并且按最小权限发放凭据：挂载用短期、沙箱范围、只读的凭据，需要写回才开 `read_only=False`。
 
+---
+
 ## 常见坑与排查
+
+按症状查，每条都给出"症状 → 原因 → 修法"。
 
 1. **改了 manifest，沙箱里却没变**
    - 症状：工作区内容与新的 manifest 对不上。
@@ -417,11 +484,16 @@ Unix-local 在 Linux 上就是宿主进程。工作区目录、`HOME`、`cwd` �
    - 原因：沙箱里没有 `git`。
    - 修法：Unix-local 装 git；Docker/托管在镜像里预装 git。
 
+---
+
 ## 动手练习
 
-1. **读懂默认值**：不传 `capabilities`，用 `Runner.run` 跑一个"列出工作区所有文件"的任务，然后把 `capabilities` 显式写成 `[Shell()]` 再跑一次。记录第二次少了哪些工具，并解释原因。
-2. **换成 Docker 并断网**：把上面 code review 示例切到 `DockerSandboxClient`，加 `network_mode="none"`。观察 `pip install` 之类的命令如何失败，写出你会怎么调整镜像或命令。
-3. **改造仓库示例**：打开 `repo/examples/sandbox/tutorials/repo_code_review/main.py`，把 `AGENTS.md` 里"恰好两条 finding"的约束改成"按严重度排序、最多三条、必须包含一个 CI 相关发现"，再跑 `evals.py`，观察断言在哪一条上失败、为什么。
+1. **立刻跑主线**：在 `openai-agents-python/` 下运行 `sandbox_review.py`，确认 `review-output/` 里出现 `review.md` 与 `findings.jsonl`。这是本章最短的成功验证。
+2. **读懂默认值**：不传 `capabilities`，用 `Runner.run` 跑一个"列出工作区所有文件"的任务，然后把 `capabilities` 显式写成 `[Shell()]` 再跑一次。记录第二次少了哪些工具，并解释原因。
+3. **换成 Docker 并断网**：把上面 code review 示例切到 `DockerSandboxClient`，加 `network_mode="none"`。观察 `pip install` 之类的命令如何失败，写出你会怎么调整镜像或命令。
+4. **改造仓库示例**：打开 `repo/examples/sandbox/tutorials/repo_code_review/main.py`，把 `AGENTS.md` 里"恰好两条 finding"的约束改成"按严重度排序、最多三条、必须包含一个 CI 相关发现"，再跑 `evals.py`，观察断言在哪一条上失败、为什么。
+
+---
 
 ## 本章小结
 
@@ -431,6 +503,8 @@ Unix-local 在 Linux 上就是宿主进程。工作区目录、`HOME`、`cwd` �
 - 选后端顺序：可信本地用 Unix-local（Linux 无 OS 隔离、Windows 不可用）→ 需要隔离用 Docker → 需要弹性用托管。
 - `session_state` 接回后端会话，`snapshot` 喂新会话内容；序列化剥离凭据，恢复要带可信 manifest。
 - `stop()` 存档不拆沙箱，`aclose()` 完整清理，`client.delete(sandbox)` 释放后端资源。
+
+---
 
 ## 延伸阅读
 

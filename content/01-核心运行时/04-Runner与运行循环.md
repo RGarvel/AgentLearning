@@ -1,8 +1,10 @@
 # 第4章 Runner与运行循环
 
-上一章我们把 `Agent` 拆成了字段，也说过它"几乎不做任何事，只负责声明"。那么谁让声明动起来？答案是 `Runner`。
+上一章我们把 `Agent` 拆成了字段，也说过它"几乎不做任何事，只负责声明"。那么谁让声明动起来？答案是 `Runner`（运行器）。
 
-本章要回答的问题是：**当你写下 `await Runner.run(agent, "……")` 的那一毫秒之后，到 `final_output` 出现之前，到底发生了什么。** 把这段搞明白，你就能解释大多数"它为什么又调了一次""它怎么突然结束了"。读完你会知道一次回合（turn）的六个步骤、唯一的停止规则，以及 `RunConfig` 和 `RunState` 各自管什么。
+本章要回答的问题是：当你写下 `await Runner.run(agent, "……")` 的那一毫秒之后，到 `final_output` 出现之前，到底发生了什么。把这段搞明白，你就能解释大多数"它为什么又调了一次""它怎么突然结束了"。
+
+按这章走完，你会得到三样东西：一次回合（turn）的六步骨架、唯一停止规则、以及能跑的超限与恢复脚本。
 
 ---
 
@@ -19,7 +21,7 @@
 
 ## 一、三个入口与完整签名
 
-三个入口的差别只有两点：是否异步、返回什么。签名都在 `repo/src/agents/run.py`，先看 `run`：
+三个入口的差别只有两点：是否异步、返回什么。签名都在 `repo/src/agents/run.py`，先看 `run`。**这是签名片段，摘自源码，不是完整脚本**，只用于对照参数，不需要存盘运行。
 
 ```python
 class Runner:
@@ -43,7 +45,7 @@ class Runner:
 
 `run_sync` 的参数与 `run` 完全一致，只是把 `async` 换成同步返回。它的 docstring 明确了一句很重要的话：**它只是 `run` 的包装，如果当前已经有事件循环（在 async 函数里、Jupyter 里、FastAPI 请求里），它不能工作**。那种场合请直接用 `run`。
 
-`run_streamed` 有两个必须记住的差异，签名如下：
+`run_streamed` 有两个必须记住的差异。**这同样是从 `repo/src/agents/run.py` 摘出的签名片段，不是完整脚本**。
 
 ```python
     @classmethod
@@ -67,13 +69,27 @@ class Runner:
 1. 它**不是 `async def`**：调用后立即返回一个 `RunResultStreaming`，真正的执行在后台任务里跑。
 2. 除 `error_handlers` 外，其余参数都是位置或关键字皆可。这一点和 `run` 不同，写代码时建议一律用关键字，避免日后签名变化带来的静默错位。
 
-> 提示：`run_streamed` 返回的对象在你开始迭代 `stream_events()` 之前并不"完成"。`final_output` 在流结束前一直是 `None`（第 21 章）。
+提示：`run_streamed` 返回的对象在你开始迭代 `stream_events()` 之前并不"完成"。`final_output` 在流结束前一直是 `None`（第 21 章）。
+
+### 跑通本章示例的配置清单
+
+本章脚本都会真正调用模型，所以第 2 章那套配置必须先就位。下面把本章涉及的每一项列全，逐项说明漏了会报什么错。
+
+| 配置项 | 在哪设 | 漏了或设错会报什么错 |
+| --- | --- | --- |
+| `OPENAI_API_KEY`（或网关 key） | 环境变量，第 2 章 | 模型调用鉴权失败 |
+| 模型名 | `Agent(model=...)` 或 `RunConfig(model=...)` | 网关场景沿用 `gpt-5.6-luna`，报 `model not found` |
+| base URL / API 形态（仅网关） | 第 2 章的 client 与设置函数 | 报 401 或 404 |
+| `max_turns` | `Runner.run(..., max_turns=...)` | 漏了用默认 10，长任务抛 `MaxTurnsExceeded` |
+| `error_handlers` 的键名 | `{"max_turns": ..., ...}` | 键拼错不生效，异常照旧抛出 |
+| 历史归属参数 | `session` / `previous_response_id` 等 | 混用两套托管，历史出现重复 |
+| 审批工具 `@tool(needs_approval=True)` | 工具定义处 | 漏了 `interruptions` 为空，恢复分支不触发 |
 
 ---
 
 ## 二、input 的三种形态
 
-`input` 有三种形态，通向同一个循环，区别只在"模型输入从哪来"：
+`input` 有三种形态，通向同一个循环，区别只在"模型输入从哪来"。
 
 | 形态 | 含义 | 典型场景 |
 | --- | --- | --- |
@@ -98,7 +114,7 @@ class Runner:
 
 ## 三、一次 turn 内部发生了什么
 
-一次回合的骨架是"调模型、处理输出、决定是否继续"。官方 docstring 把循环浓缩成四句，这里展开成六步，并标注源码位置：
+一次回合的骨架是"调模型、处理输出、决定是否继续"。官方 docstring 把循环浓缩成四句，这里展开成六步，并标注源码位置。
 
 ```text
 turn 开始
@@ -130,9 +146,7 @@ turn 开始
 
 ## 四、什么时候停：唯一判定规则
 
-停止条件只有一条，官方把它写在 `repo/docs/running_agents.md`：
-
-> 模型产出**期望类型的文本**，且**没有工具调用**，才算最终输出。
+停止条件只有一条，官方把它写在 `repo/docs/running_agents.md`：模型产出**期望类型的文本**，且**没有工具调用**，才算最终输出。
 
 拆开看是三个条件：
 
@@ -153,7 +167,7 @@ turn 开始
 
 ## 五、max_turns 与 MaxTurnsExceeded
 
-轮次上限是硬约束，不是软提示。`max_turns` 默认值是 `DEFAULT_MAX_TURNS = 10`（`repo/src/agents/run_config.py`），判断条件是 `current_turn > max_turns`：
+轮次上限是硬约束，不是软提示。`max_turns` 默认值是 `DEFAULT_MAX_TURNS = 10`（`repo/src/agents/run_config.py`），判断条件是 `current_turn > max_turns`。下面这段验证"超限就是异常，不是返回半成品"。
 
 ```python
 import asyncio
@@ -172,14 +186,22 @@ async def main() -> None:
         print(f"没跑完：{exc}")   # 预期输出：没跑完：Max turns (3) exceeded
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-这段要验证的是：**超限就是异常，不是"返回半成品"**。预期输出是 `没跑完：Max turns (3) exceeded`。
+把它存成 `max_turns_demo.py`，放在 SDK 根目录 `openai-agents-python/` 下。运行命令：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python max_turns_demo.py
+```
+
+预期输出是 `没跑完：Max turns (3) exceeded`。这里有个前提：这个任务得真的跑过 3 轮才超限，若模型一轮就答完，会正常打印输出；想稳定复现可把指令改成"分十步逐条输出"。
 
 - 设 `max_turns=None` 可以彻底关闭上限，只在你能确定循环一定收敛时使用。
 - 异常信息里只有 `Max turns (N) exceeded`，**不包含任何输入输出**。想知道停在哪一步，去看 `result`？没有 result；要看 trace（第 22 章）。
-- 如果不想抛异常，用 `error_handlers={"max_turns": ...}` 返回一个受控的兜底输出：
+- 如果不想抛异常，用 `error_handlers={"max_turns": ...}` 返回一个受控的兜底输出。下面这段验证"把异常变成可交付输出"。
 
 ```python
 from agents import Agent, RunErrorHandlerInput, RunErrorHandlerResult, Runner
@@ -192,16 +214,29 @@ def on_max_turns(_data: RunErrorHandlerInput[None]) -> RunErrorHandlerResult:
     )
 
 
-result = Runner.run_sync(
-    agent,
-    "把这份 200 页的文档整理成提纲",
-    max_turns=3,
-    error_handlers={"max_turns": on_max_turns},
-)
-print(result.final_output)
+def main() -> None:
+    agent = Agent(name="资料整理员", instructions="分步整理资料。")
+    result = Runner.run_sync(
+        agent,
+        "把这份 200 页的文档整理成提纲",
+        max_turns=3,
+        error_handlers={"max_turns": on_max_turns},
+    )
+    print(result.final_output)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-这段验证的是"把异常变成可交付输出"，预期打印 `超出轮次上限，请把需求拆小一点。`。
+把它存成 `max_turns_fallback_demo.py`，放在 SDK 根目录 `openai-agents-python/` 下。运行命令：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python max_turns_fallback_demo.py
+```
+
+预期输出：`超出轮次上限，请把需求拆小一点。`（在任务确实超限时；链路里用 `run_sync`，不要在已有事件循环的上下文中运行它。）
 
 `error_handlers` 支持三个键：`"max_turns"`、`"model_refusal"`、`"invalid_final_output"`。三者的共同点是"把异常变成一次可交付的输出"，区别在触发条件。注意 `include_in_history` 默认是 `True`，兜底文案默认会被写进历史并持久化到 session，多数场景你希望它是 `False`。
 
@@ -209,7 +244,7 @@ print(result.final_output)
 
 ## 六、handoff 如何改变"当前 Agent"
 
-交接不是"调用一个子 Agent 再回来"，而是**控制权转移**。源码里它的落地方式是切换循环里的当前 Agent，然后回到回合开头：
+交接不是"调用一个子 Agent 再回来"，而是**控制权转移**。源码里它的落地方式是切换循环里的当前 Agent，然后回到回合开头。
 
 ```text
 [2] 模型输出 handoff 调用（transfer_to_refund_agent）
@@ -241,25 +276,41 @@ print(result.final_output)
 - **模型**：`run_config.model` 是 `Model` 实例就直接用；是字符串就用 `model_provider` 解析；都没设才用 `agent.model`。
 - **模型参数**：`agent.model_settings.resolve(prepared_overrides).resolve(run_config.model_settings)`。**RunConfig 是最后一层覆盖**，非 `None` 的字段逐个盖上去。
 
-下面这段演示不改 Agent、只改运行参数：
+下面这段演示不改 Agent、只改运行参数，并真正跑一次看结果。
 
 ```python
-from agents import ModelSettings, RunConfig, Runner
+import asyncio
+
+from agents import Agent, ModelSettings, RunConfig, Runner
 
 
-result = await Runner.run(
-    agent,
-    "把这份 200 页的文档整理成提纲",
-    run_config=RunConfig(
-        model="gpt-5-nano",                       # 全局换模型，不改 Agent
-        model_settings=ModelSettings(temperature=0.0),
-        workflow_name="资料整理",                  # trace 里的工作流名
-        trace_include_sensitive_data=False,        # 不把输入输出写进 trace
-    ),
-)
+async def main() -> None:
+    agent = Agent(name="资料整理员", instructions="分步整理资料。")
+    result = await Runner.run(
+        agent,
+        "把这份 200 页的文档整理成提纲",
+        run_config=RunConfig(
+            model="gpt-5-nano",                       # 全局换模型，不改 Agent
+            model_settings=ModelSettings(temperature=0.0),
+            workflow_name="资料整理",                  # trace 里的工作流名
+            trace_include_sensitive_data=False,        # 不把输入输出写进 trace
+        ),
+    )
+    print(result.final_output)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-预期结果是同一个 `agent` 用上了新模型与新温度，而 Agent 对象本身没有任何改动。
+把它存成 `run_config_demo.py`，放在 SDK 根目录 `openai-agents-python/` 下。运行命令：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python run_config_demo.py
+```
+
+预期输出是模型用 `gpt-5-nano`、温度 0.0 给出的一份提纲，而 Agent 对象本身没有任何改动。网关场景记得把 `model` 换成网关真正支持的模型名。
 
 按用途把常用字段分四组（全部来自 `repo/src/agents/run_config.py`）：
 
@@ -274,29 +325,57 @@ result = await Runner.run(
 
 如果这些差异写在 Agent 上，你就得为每种组合各造一个 Agent。写在 `RunConfig` 上，Agent 保持一份干净的声明。
 
-> 注意：`session` 与 `conversation_id` / `previous_response_id` / `auto_previous_response_id` **不能在同一次 run 里混用**。前者是客户端托管历史，后者是服务端托管，混用会造成历史重复（第 17、18 章）。
+注意：`session` 与 `conversation_id` / `previous_response_id` / `auto_previous_response_id` **不能在同一次 run 里混用**。前者是客户端托管历史，后者是服务端托管，混用会造成历史重复（第 17、18 章）。
 
 ---
 
 ## 八、以 RunState 为输入的恢复入口
 
-暂停的 run 靠快照恢复。当一次 run 因为"需要人工审批"而暂停时，`result.interruptions` 会非空，此时 `final_output` 可能是 `None`。恢复流程只有三步：
+暂停的 run 靠快照恢复。当一次 run 因为"需要人工审批"而暂停时，`result.interruptions` 会非空，此时 `final_output` 可能是 `None`。下面这段用一个必须审批的工具，把"暂停 → 批准 → 恢复"完整跑一遍。
 
 ```python
+import asyncio
+
 from agents import Agent, Runner
+from agents.decorators import tool
 
-agent = Agent(name="运维助手", instructions="按需执行命令。")
 
-result = await Runner.run(agent, "清理临时文件")
+@tool(needs_approval=True)
+def delete_files(path: str) -> str:
+    """删除临时文件。"""
+    return f"已删除 {path}"
 
-if result.interruptions:
-    state = result.to_state()
-    for item in result.interruptions:
-        state.approve(item)          # 或 state.reject(item, rejection_message="...")
-    result = await Runner.run(agent, state)   # 注意第二个参数是 state
+
+async def main() -> None:
+    agent = Agent(
+        name="运维助手",
+        instructions="用户要求清理文件时，必须调用 delete_files 工具。",
+        tools=[delete_files],
+    )
+
+    result = await Runner.run(agent, "清理临时文件 /tmp/cache")
+    print("第一次：", result.interruptions)
+
+    if result.interruptions:
+        state = result.to_state()
+        for item in result.interruptions:
+            state.approve(item)          # 或 state.reject(item, rejection_message="...")
+        result = await Runner.run(agent, state)   # 注意第二个参数是 state
+        print("恢复后：", result.final_output)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-预期结果是第二次 `Runner.run` 从断点继续，而不是重新问一遍。要点只有一句：**恢复时传 `RunState` 而不是原始输入**，`starting_agent` 仍然要传（它是用来重建 Agent 图的）。
+把它存成 `runstate_resume_demo.py`，放在 SDK 根目录 `openai-agents-python/` 下。运行命令：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python runstate_resume_demo.py
+```
+
+预期输出：第一行打印出待审批项的列表，形如 `[ToolApprovalItem(...)]`；批准后第二行打印模型的收尾回复。要点只有一句：**恢复时传 `RunState` 而不是原始输入**，`starting_agent` 仍然要传（它是用来重建 Agent 图的）。
 
 `RunState` 还支持 `add_input("补充一句")` 在恢复前追加用户输入、`to_json()` / `from_string()` 做持久化。
 
@@ -305,6 +384,8 @@ if result.interruptions:
 ---
 
 ## 常见坑与排查
+
+按症状查，每条都给出"症状 → 原因 → 修法"。
 
 1. **症状**：在 FastAPI 或 Jupyter 里调用 `Runner.run_sync`，报"event loop is already running"。
    **原因**：`run_sync` 只是 `run` 的包装，内部要新建事件循环。
@@ -338,11 +419,10 @@ if result.interruptions:
 2. **制造超限**：把 `max_turns` 设成 1，观察 `MaxTurnsExceeded` 的消息内容。再用 `error_handlers` 把它变成受控输出，确认 `include_in_history` 两种取值的差别（用 `result.new_items` 验证）。
 3. **改仓库示例**：打开 `repo/examples/agent_patterns/routing.py`，给它加 `max_turns=2` 与 `RunConfig(workflow_name="分诊实验")`，跑一遍并解释：为什么在只有一次交接的场景里，2 已经接近下限？
 
-先跑一遍未改动的版本作对照。若仓库 clone 在别处，按自己的目录替换这一段路径：
+先跑一遍未改动的版本作对照。若仓库 clone 在别处，按自己的路径替换：
 
 ```bash
-# 工作目录：repo/openai-agents-python/（SDK 根目录）
-cd repo/openai-agents-python
+# 工作目录：openai-agents-python/（SDK 根目录）
 python examples/agent_patterns/routing.py
 ```
 

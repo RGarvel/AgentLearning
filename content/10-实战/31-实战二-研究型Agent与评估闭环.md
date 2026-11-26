@@ -6,7 +6,9 @@
 
 问题于是从"怎么让它跑起来"变成三个更难的：怎么知道它做得好、怎么让好可复现、怎么把成本压住。
 
-这一章我们搭一个研究型 Agent：规划、搜索、阅读、结构化报告。然后围绕它建一条能进 CI 的评估闭环。
+这一章我们搭一个研究型 Agent：规划、搜索、阅读、结构化报告，然后围绕它建一条能进 CI 的评估闭环。
+
+**默认主线**在第 2 节：先一次备齐配置，再按依赖顺序建 `research_app/` 项目，跑出第一份结构化报告，最后跑一次评估和测试。成本实验、换模型、改并发都放到主线之后作可选微调。
 
 ## 学习目标
 
@@ -60,11 +62,74 @@ query
 
 图里三个角色各司其职：规划只出计划，搜索并行压缩，写作串行成文。
 
-三个 Agent 的定义都很短，短到你可以逐字读完。这是刻意的。注意目录名用 `research_agents/` 而不是 `agents/`，后者会遮蔽已安装的 SDK 包。
+三个 Agent 的定义都很短，短到你可以逐字读完，这是刻意的。注意目录名用 `research_agents/` 而不是 `agents/`，后者会遮蔽已安装的 SDK 包。
 
 研究型系统里，prompt 的每一句都在为评估指标负责。写长了，你就不知道是哪句起了作用。
 
-先看规划器。这段验证的是"用 schema 把搜索计划钉死"。
+### 先看路径约定（不看会走错）
+
+课程正文里的 `repo/xxx` 是 SDK 仓库内路径，点击跳到 GitHub v0.25.0 的对应文件；本机目录一律叫 `openai-agents-python/`，不叫 `repo/`。
+
+| 课程里写的（可点击） | 你本机打开的文件 |
+| --- | --- |
+| `repo/examples/research_bot/manager.py` | `openai-agents-python/examples/research_bot/manager.py` |
+
+后面所有命令都相对本机 SDK 根目录；若你的源码 clone 在别处，把命令里的 `openai-agents-python` 换成自己的路径即可，后文不再重复。
+
+### 跑通所需配置对照表
+
+这张表列全从零跑通这条流水线要备的东西，逐项说明漏了报什么错。前三项在第 2 章已备好，这里只做核对。
+
+| 配置项 | 是什么 | 怎么备齐 | 漏了会报什么错 |
+| --- | --- | --- | --- |
+| Python 3.12 + uv | 运行环境 | 见第 2 章，用 `python --version`、`uv --version` 验证 | Python 3.9 在 import 阶段报语法错；没 uv 则 `uv: command not found` |
+| SDK 0.25.0 可编辑安装 | `agents` 包 | 在 `openai-agents-python/` 下执行 `uv pip install -e .` | `ModuleNotFoundError: No module named 'agents'` |
+| `OPENAI_API_KEY` | 模型搜索与调用凭据 | 环境变量设官方 key | 模型调用报鉴权失败；trace 只有 warning |
+| 官方 Responses API + OpenAI 模型 | 托管工具 `WebSearchTool` 的运行前提 | 用官方 key 且不要切 `set_default_openai_api("chat_completions")` | 切到 Chat Completions 后搜索工具不可用，报接口不支持 |
+| 模型名 `gpt-5-nano`、`gpt-5.6-sol` | 规划/搜索用便宜模型，写作/评审用强模型 | 确认账号可访问这两个模型；换模型改 `Agent(model=...)` 字符串 | `model not found` 或 403 权限不足 |
+| 网络可达 `api.openai.com` | 搜索与模型调用 | 公司代理设 `HTTPS_PROXY`/`HTTP_PROXY` | `APIConnectionError` 或超时 |
+| pydantic ≥2.12 | schema 定义（`BaseModel`、`Literal`） | 随 SDK 运行时依赖自动装 | `ModuleNotFoundError: No module named 'pydantic'` |
+| pytest + pytest-asyncio | 跑第 7 节形状测试 | `uv pip install pytest pytest-asyncio` | `pytest: command not found`；`@pytest.mark.asyncio` 不被识别 |
+| 问题集 `evals/cases.py` | 带可断言期望的固定问题 | 代码里先给 2 条样例，自己补到 20 条 | 只有样例时覆盖率不足，无法判断改动好坏 |
+| `eval_results.jsonl` | 评估结果落盘 | 由 `evaluate(out_path)` 自动写 | 不落盘就无法做版本间对比 |
+
+> 主线会真实调用模型与搜索，按量计费。想先零成本验证结构，可直接跳到第 7 节的形状测试。
+
+### 默认主线：从空目录到第一份报告
+
+按下面六步走，不跳步。写文件的顺序按依赖关系排，和章节编号不同，照这个顺序写才不会卡在 import 上。
+
+1. 按第 2 章备好环境：Python 3.12、uv、SDK 0.25.0 可编辑安装，以及官方 key。
+2. 在 SDK 根目录建 `research_app/`，里面再建 `research_agents/`、`evals/`、`tests/` 三个子目录；在前两个子目录各放一个空的 `__init__.py`。
+3. 依次写四个文件：`research_agents/planner.py` → `research_agents/searcher.py` → `research_agents/writer.py` → `pipeline.py`，完整代码分别在本节和第 4 节。
+4. 再写 `evals/cases.py` → `evals/judge.py` → `evals/run_evals.py` → `evals/run.py`（第 5 节）。
+5. 写 `tests/test_pipeline_contract.py`（第 7 节）和入口 `cli.py`（本节末尾）。
+6. 跑 `python cli.py` 拿到第一份报告，再跑 `python -m evals.run` 拿到一行行评估结果，最后跑 `python -m pytest tests -q` 验证形状测试。
+
+完整目录形状如下：
+
+```text
+research_app/
+├── cli.py                 # 终端入口，默认主线的运行起点
+├── pipeline.py            # 编排层：并发、降级、token 汇总
+├── research_agents/
+│   ├── __init__.py
+│   ├── planner.py
+│   ├── searcher.py
+│   └── writer.py
+├── evals/
+│   ├── __init__.py
+│   ├── cases.py
+│   ├── judge.py
+│   ├── run_evals.py
+│   └── run.py             # 评估入口
+└── tests/
+    └── test_pipeline_contract.py
+```
+
+这套顺序之外的一切都算可选微调，主线跑通后再试：把 `asyncio.gather` 换成 `as_completed`、把 `search_context_size` 在 `low`/`medium` 之间调档、把写作模型换成更强的。
+
+先看规划器。这段验证的是"用 schema 把搜索计划钉死"。**这是 `research_agents/planner.py` 的完整内容，模块文件，不是能单独运行的脚本**：由 `pipeline.py` 导入，顶部依赖 `pydantic.BaseModel` 与 `agents.Agent`。
 
 ```python
 # research_agents/planner.py
@@ -100,9 +165,18 @@ planner_agent = Agent(
 )
 ```
 
-预期结果是：模型返回 5 到 8 条 `WebSearchItem`，每条都带检索词和它存在的理由。
+存成 `planner.py`，放在 `research_app/research_agents/` 下。验证它能被导入：
 
-检索器只做一次搜索、一次压缩。这段验证的是"用指令给单次搜索封顶"。
+```bash
+# 工作目录：openai-agents-python/research_app/
+python -c "from research_agents.planner import WebSearchPlan, planner_agent; print(planner_agent.name)"
+```
+
+预期输出 `Planner`，说明 `WebSearchPlan` schema 和 Agent 都构造成功。
+
+预期结果是模型返回 5 到 8 条 `WebSearchItem`，每条都带检索词和它存在的理由。
+
+检索器只做一次搜索、一次压缩。这段验证的是"用指令给单次搜索封顶"。**这是 `research_agents/searcher.py` 的完整内容，模块文件，不是独立脚本**：由 `pipeline.py` 导入，顶部依赖 `agents.Agent` 与 `agents.WebSearchTool`。
 
 ```python
 # research_agents/searcher.py
@@ -119,9 +193,18 @@ search_agent = Agent(
 )
 ```
 
-预期结果是：每条搜索打回 2-3 段摘要，总长不超过 300 词。
+存成 `searcher.py`，放在 `research_app/research_agents/` 下。验证：
 
-写作器消费摘要，产出结构化报告。这段验证的是"输出能被下游直接消费"。
+```bash
+# 工作目录：openai-agents-python/research_app/
+python -c "from research_agents.searcher import search_agent; print(search_agent.name)"
+```
+
+预期输出 `Searcher`，说明托管工具 `WebSearchTool` 挂载成功（此时还没发请求）。
+
+预期结果是每条搜索打回 2-3 段摘要，总长不超过 300 词。
+
+写作器消费摘要，产出结构化报告。这段验证的是"输出能被下游直接消费"。**这是 `research_agents/writer.py` 的完整内容，模块文件，不是独立脚本**：由 `pipeline.py` 导入，顶部依赖 `pydantic.BaseModel` 与 `agents.Agent`。
 
 ```python
 # research_agents/writer.py
@@ -148,7 +231,7 @@ writer_agent = Agent(
     name="Writer",
     instructions=(
         "你是资深研究员。基于给定的检索摘要写一份报告：先列提纲，再成文。"
-        "所有数字必须来自摘要；摘要没给的信息就写"未找到可靠来源"，不要补。"
+        "所有数字必须来自摘要；摘要没给的信息就写“未找到可靠来源”，不要补。"
         "报告 1000 字以上，结尾附 3 个后续研究问题。"
     ),
     model="gpt-5.6-sol",
@@ -156,20 +239,66 @@ writer_agent = Agent(
 )
 ```
 
-预期结果是：`ReportData` 四个字段全部填满，正文里的数字都能在摘要里找到。
+存成 `writer.py`，放在 `research_app/research_agents/` 下。验证：
+
+```bash
+# 工作目录：openai-agents-python/research_app/
+python -c "from research_agents.writer import ReportData, writer_agent; print(writer_agent.name)"
+```
+
+预期输出 `Writer`，说明 `ReportData` 的四个字段和 Agent 都构造成功。
+
+> 提示：原指令里"未找到可靠来源"若用半角引号嵌套会触发 `SyntaxError`，这里用全角引号包住，语义不变、脚本可直接跑。
+
+预期结果是 `ReportData` 四个字段全部填满，正文里的数字都能在摘要里找到。
 
 这三份定义要验证的是"职责单一 + 契约明确"。四个关键点如下。
 
 | 要点 | 说明 |
 | --- | --- |
 | 模型分工 | 规划用便宜模型（`gpt-5-nano`）、写作用好模型，这是研究型系统里性价比最高的一次分工。规划错了重跑很便宜，写作重跑很贵。 |
-| `WebSearchTool` | 它是**托管工具**，只在 OpenAI 模型 + Responses API 下可用。`search_context_size` 取 `"low" / "medium" / "high"`，是控制单次搜索上下文成本最直接的旋钮。 |
+| `WebSearchTool` | 它是**托管工具（hosted tool）**，只在 OpenAI 模型 + Responses API 下可用。`search_context_size` 取 `"low" / "medium" / "high"`，是控制单次搜索上下文成本最直接的旋钮。 |
 | 300 词上限 | 检索助手的指令里写死"不超过 300 词"，这不是风格要求，是在替写作阶段省上下文。 |
 | 反幻觉条款 | 写作指令里"摘要没给的信息就写未找到"，既是反幻觉条款，也是后面评估要检查的点。 |
 
+### 入口脚本 cli.py（默认主线的运行入口）
+
+把下面这份存成 `cli.py`，放在 `research_app/` 下。它是完整脚本，直接跑；只负责读一个问题、打印结论、把报告落盘，流水线从 `pipeline.py` 导入。
+
+```python
+# research_app/cli.py
+import asyncio
+from pathlib import Path
+
+from pipeline import run_research
+
+
+async def main() -> None:
+    query = input("研究问题> ").strip()
+    if not query:
+        query = "2026 年主流 B2B SaaS 的按席位定价趋势"
+    result = await run_research(query)
+    print("核心结论：", result.report.short_summary)
+    print(f"成功 {result.succeeded} 条，失败 {result.failed} 条，总 token {result.total_tokens}")
+    Path("last_report.md").write_text(result.report.markdown_report, encoding="utf-8")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+运行它：
+
+```bash
+# 工作目录：openai-agents-python/research_app/
+python cli.py
+```
+
+预期输出：先要求输入研究问题，随后打印一行核心结论与一行 token 统计，并在当前目录生成 `last_report.md`。看到这些，说明规划、并发搜索、写作三段都通了，这是本章的总验收点。
+
 ## 三、结构化产出：让报告能被断言
 
-`output_type=ReportData` 的收益不止"好看"。它把一次 run 的输出变成了一个有 schema 的对象，于是下面三件事都变得可做。
+`output_type=ReportData` 的收益不止"好看"。它把一次 run 的输出变成一个有 schema 的对象，于是下面三件事都变得可做。
 
 | 用法 | 得到什么 |
 | --- | --- |
@@ -177,7 +306,7 @@ writer_agent = Agent(
 | 对字段做断言 | `len(follow_up_questions) == 3`、`markdown_report` 长度下限，都能自动检查 |
 | 把 `sources` 与检索摘要交叉核对 | 抓"编造引用"。这要求检索阶段保留 URL，否则只能核对域名 |
 
-设计 schema 有两条经验：**字段少而语义清楚**，以及**把你要断言的字段单独列出来**。
+设计结构化输出（structured output）的 schema 有两条经验：**字段少而语义清楚**，以及**把你要断言的字段单独列出来**。
 
 `short_summary` 和 `markdown_report` 分开就是这个原因。前者适合做人工抽检和相似度比较，后者适合做长度与引用检查。
 
@@ -189,7 +318,7 @@ writer_agent = Agent(
 
 对策是三件事：用信号量把并发压到 3-4，配一个 `max_turns` 兜底，再统一汇总 token。
 
-下面这段是编排层，验证的是"并发可控、失败可降级、成本可计量"。
+下面这段是编排层，验证的是"并发可控、失败可降级、成本可计量"。**这是 `pipeline.py` 的完整内容，模块文件，不是独立脚本**：由 `cli.py` 和 `evals/run_evals.py` 导入，顶部依赖 `research_agents` 下的三个模块。
 
 ```python
 # pipeline.py
@@ -258,7 +387,16 @@ async def run_research(query: str) -> ResearchResult:
         )
 ```
 
-预期结果是：`ResearchResult` 带回结构化报告、证据摘要、总 token，以及成功和失败的条数。四个关键行如下。
+存成 `pipeline.py`，放在 `research_app/` 下。验证它能被导入：
+
+```bash
+# 工作目录：openai-agents-python/research_app/
+python -c "import pipeline; print(pipeline.MAX_CONCURRENT_SEARCHES, pipeline.MAX_SEARCHES)"
+```
+
+预期输出 `4 8`，说明编排层与三个 Agent 模块都接上了。
+
+预期结果是 `ResearchResult` 带回结构化报告、证据摘要、总 token，以及成功和失败的条数。四个关键行如下。
 
 | 要点 | 说明 |
 | --- | --- |
@@ -281,9 +419,7 @@ async def run_research(query: str) -> ResearchResult:
 
 评估的最小可用形态是"**固定问题集 + 每次跑完写一行结果**"。
 
-先建 20 条覆盖典型场景的问题，每条带上你能自动检查的期望。
-
-下面这份 `cases.py` 验证的是"期望能写成字段"。
+先建 20 条覆盖典型场景的问题，每条带上你能自动检查的期望。下面这份 `cases.py` 验证的是"期望能写成字段"。**它是 `evals/cases.py` 的完整内容，模块文件，不是独立脚本**：由 `evals/run_evals.py` 导入，没有外部依赖，代码里先给 2 条样例，你补齐到 20 条。
 
 ```python
 # evals/cases.py
@@ -305,7 +441,16 @@ CASES = [
 ]
 ```
 
-预期结果是：每条 case 都带 `min_chars`、`required_terms`、`max_tokens` 三个可断言的期望。
+存成 `cases.py`，放在 `research_app/evals/` 下。验证：
+
+```bash
+# 工作目录：openai-agents-python/research_app/
+python -c "from evals.cases import CASES; print(len(CASES), CASES[0]['id'])"
+```
+
+预期输出 `2 b2b-saas-pricing`，说明问题集可被导入；补齐后这个数字应变成 20。
+
+预期结果是每条 case 都带 `min_chars`、`required_terms`、`max_tokens` 三个可断言的期望。
 
 然后在同一份评估脚本里跑三层检查，每层抓不同的错。
 
@@ -319,7 +464,7 @@ CASES = [
 
 `repo/examples/financial_research_agent/agents/verifier_agent.py` 是个好范本。它明确要求"只依据提供的证据判断，不要用你自己的记忆"，输出 `verified` 加问题列表。
 
-下面这份评审 Agent 验证的是"把观点从判断里摘出去"。
+下面这份评审 Agent 验证的是"把观点从判断里摘出去"。**这是 `evals/judge.py` 的完整内容，模块文件，不是独立脚本**：由 `evals/run_evals.py` 导入，顶部依赖 `pydantic.BaseModel`、`pydantic.Literal` 与 `agents.Agent`。
 
 ```python
 # evals/judge.py
@@ -354,9 +499,18 @@ judge_agent = Agent(
 )
 ```
 
-预期结果是：输出 `score`（1-5 分）与问题列表 `issues`，4 分及以上视为通过。
+存成 `judge.py`，放在 `research_app/evals/` 下。验证：
 
-评估主循环把三层拼起来，每跑一条就写一行 JSONL，方便后面做对比。
+```bash
+# 工作目录：openai-agents-python/research_app/
+python -c "from evals.judge import JudgeVerdict, judge_agent; print(judge_agent.name)"
+```
+
+预期输出 `Report judge`，说明评审 schema 与 Agent 都构造成功。
+
+预期结果是输出 `score`（1-5 分）与问题列表 `issues`，4 分及以上视为通过。
+
+评估主循环把三层拼起来，每跑一条就写一行 JSONL，方便后面做对比。下面这份是 `evals/run_evals.py` 的完整内容，**模块文件，不是独立脚本**：`evaluate(out_path)` 由本节末尾的 `evals/run.py` 调用，前置依赖是 `evals/cases.py`、`evals/judge.py` 与 `pipeline.py`。
 
 ```python
 # evals/run_evals.py
@@ -414,9 +568,39 @@ async def evaluate(out_path: Path) -> list[dict]:
     return rows
 ```
 
-预期结果是：每条 case 写一行 JSONL，`checks` 四项全过且 `judge_score >= 4`，`passed` 才是 `true`。
+预期结果是每条 case 写一行 JSONL，`checks` 四项全过且 `judge_score >= 4`，`passed` 才是 `true`。
 
 这段要验证的是"评估结果是数据，不是感觉"。写 JSONL 而不是打印，是因为下一步要做版本间对比：同一批 case、同一套指标、两次运行的差异。
+
+评估要有入口才能整段跑。把下面这份存成 `run.py`，放在 `research_app/evals/` 下，它是完整脚本，负责传入输出路径并打印通过数。
+
+```python
+# research_app/evals/run.py
+import asyncio
+from pathlib import Path
+
+from evals.run_evals import evaluate
+
+
+async def main() -> None:
+    out_path = Path("eval_results.jsonl")
+    rows = await evaluate(out_path)
+    passed = sum(1 for row in rows if row["passed"])
+    print(f"通过 {passed}/{len(rows)}，结果写入 {out_path}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+运行它：
+
+```bash
+# 工作目录：openai-agents-python/research_app/
+python -m evals.run
+```
+
+预期输出形如 `通过 2/2，结果写入 eval_results.jsonl`，并在当前目录生成两行 JSONL。这个文件和 `cli.py` 生成的 `last_report.md` 一起，就是主线跑完留下的两样产出。
 
 ## 六、迭代方法论：一次只改一个变量
 
@@ -451,7 +635,7 @@ async def evaluate(out_path: Path) -> list[dict]:
 
 把它写成 pytest，断言"通过率不低于基线 - 1 条"，比断言"必须 20/20"现实得多。模型输出有方差，卡死满分只会让你天天修测试。
 
-下面这个测试验证的是"编排层的形状没被改坏"。
+下面这个测试验证的是"编排层的形状没被改坏"。存成 `test_pipeline_contract.py`，放在 `research_app/tests/` 下；它是完整 pytest 文件，顶部自带 import，不依赖前面任何模块。
 
 ```python
 # tests/test_pipeline_contract.py
@@ -477,7 +661,14 @@ async def test_writer_input_keeps_all_summaries() -> None:
     assert "[2] B" in str(model.last_call.input)
 ```
 
-预期结果是：三条断言通过，两条摘要都出现在模型输入里。这个测试不调真模型、不花钱，但能在你重构 `run_research` 时立刻发现"摘要丢了第二条"这类致命问题。
+运行它：
+
+```bash
+# 工作目录：openai-agents-python/research_app/
+python -m pytest tests/test_pipeline_contract.py -q
+```
+
+预期结果是三条断言通过，两条摘要都出现在模型输入里。这个测试不调真模型、不花钱，但能在你重构 `run_research` 时立刻发现"摘要丢了第二条"这类致命问题。
 
 这类 bug 在端到端评估里往往表现为"分数莫名其妙掉了 0.3"，极难定位。
 
@@ -500,11 +691,11 @@ async def test_writer_input_keeps_all_summaries() -> None:
 2. **做一次成本实验**：把 `search_context_size` 分别设为 `low` / `medium`，跑同一批 5 条 case，记录 `total_tokens` 与 judge 均分，画出你自己的取舍曲线。
 3. **改造仓库示例**：打开 `repo/examples/research_bot/manager.py`，把 `_perform_searches` 里的无限并发改成信号量限流（建议 4），并在返回值里带上总 token，然后用 `repo/examples/research_bot/sample_outputs/` 里的输出做一次人工对照。
 
-前两题改的是你自己的 `pipeline.py`，第三题改的是仓库示例。先切到 SDK 根目录。若你的仓库 clone 在别处（比如目录名就叫 `repo`），把路径按自己的目录替换。
+前两题改的是你自己的 `pipeline.py`，第三题改的是仓库示例。先切到 SDK 根目录。若你的仓库 clone 在别处，把命令里的 `openai-agents-python` 换成自己的目录名即可。
 
 ```bash
-# 工作目录：repo/openai-agents-python/（SDK 根目录）
-cd repo/openai-agents-python
+# 工作目录：openai-agents-python/（SDK 根目录）
+cd openai-agents-python
 ```
 
 预期结果是：你能在这个目录下找到 `examples/research_bot/manager.py`，也就是上面提到的 `repo/examples/research_bot/manager.py`。

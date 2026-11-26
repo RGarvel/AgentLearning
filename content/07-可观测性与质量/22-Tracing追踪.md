@@ -1,8 +1,47 @@
 # 第22章 Tracing追踪
 
-第 21 章把运行过程变成了可观察的事件流，但那是给人看的，而且是一次性的。凌晨三点线上那次失败，你手里只剩一张工单截图和一句“Agent 胡说八道”。这时你需要的是另一种东西：**可回溯的结构化证据**。0.25.0 的追踪（tracing）就是干这个的，它默认开启，你什么都不写也在记录。
+第 21 章把运行过程变成了可观察的事件流，但那给人看、而且一次性。凌晨三点线上那次失败，你手里只剩一张工单截图和一句“Agent 胡说八道”。这时你需要的是可回溯的结构化证据——追踪（tracing）。0.25.0 默认开启，你什么都不写也在记录。
 
-这一章讲三件事。第一是怎么读这棵 trace 树，第二是怎么把数据接到你自己的系统，第三是最常遇到的“trace 没了”。读完你会知道，怎样用一次 trace 复原整条执行路径。
+这一章走一条主线：先读懂默认记下的 trace 树，再用一个本地处理器把树打印到屏幕，最后学会把数据接到自己的系统。读完你会得到一份能直接跑通的脚本，并知道 trace 没了该去哪查。
+
+先固定路径写法，避免走错。课程里的 `repo/xxx` 是 SDK 仓库内的逻辑前缀，点击跳 GitHub 的 v0.25.0 文件；本机目录叫 `openai-agents-python/`，不叫 `repo`。下面所有命令都从 SDK 根目录发起，clone 在别处就把 `openai-agents-python` 换成自己的路径，后文不再重复。
+
+| 课程里写的（可点击） | 你本机打开的文件 |
+| --- | --- |
+| `repo/docs/tracing.md` | `openai-agents-python/docs/tracing.md` |
+| `repo/examples/basic/trace_redaction.py` | `openai-agents-python/examples/basic/trace_redaction.py` |
+| `repo/src/agents/tracing/processors.py` | `openai-agents-python/src/agents/tracing/processors.py` |
+
+### 跑通前先配齐：配置项对照表
+
+主线只需一项硬前提：按第 2 章配好的模型 key。追踪导出到 OpenAI 还涉及 key、开关、导出目标三类配置，一次列全如下。
+
+| 配置项 | 作用 | 漏了会报什么错 / 后果 | 主线怎么设 |
+| --- | --- | --- | --- |
+| `OPENAI_API_KEY` 或 `set_tracing_export_api_key()` | 默认导出器上传 trace 的凭据 | 不报致命错，只出一条 warning `OPENAI_API_KEY is not set, skipping trace export`，后台看不到 trace | 主线换成本地处理器，不需要它；要上传官方时补 |
+| 模型 key（`OPENAI_API_KEY`） | 跑 `Runner.run()` 本身 | 报 key 缺失或 401，与 tracing 无关 | 第 2 章已配好 |
+| `OPENAI_AGENTS_DISABLE_TRACING=1` | 进程级关 tracing，只读一次 | 设了没生效？第一次判断后缓存，之后改值无效 | 不设，保持默认开启 |
+| `set_tracing_disabled(True)` | 全局关 tracing，压过环境变量 | 测试里忘关会污染后端、产生噪声 trace | 主线不调；测试章才用 |
+| `RunConfig(tracing_disabled=True)` | 单次运行关 tracing | 不需要 | 主线不设 |
+| `OPENAI_AGENTS_TRACE_INCLUDE_SENSITIVE_DATA=0` / `trace_include_sensitive_data` | 剔除输入/输出载荷 | 默认 `True`；生产建议设 `0`，否则敏感数据落库 | 主线保持默认，便于看完整载荷 |
+| `set_default_openai_client(client, use_for_tracing=False)` | 模型与追踪用不同 key | 网关 key 拿去调追踪会 401 | 网关场景才用 |
+| 导出目标 `set_trace_processors([...])` | 决定数据发往哪 | 不替换就发往 OpenAI traces ingest，需要 OpenAI key | 主线替换成本地打印，零网络 |
+
+> 使用 OpenAI API 的零数据保留（ZDR）组织无法使用 tracing。这是合规约束，不是配置问题，只能改接第三方处理器。
+
+### 完整主线：五步走到底
+
+按顺序做完，每一步都有“做完标志”。其他方案都降级成后面的“可选微调”，不在这里铺开。
+
+| 步骤 | 做什么 | 做完的标志 |
+| --- | --- | --- |
+| 1 | 确认 key 与源码就位（第 2 章） | `import agents` 不报错 |
+| 2 | 读懂默认 span 树（22.1、22.2） | 能说出七种 span 的父子关系 |
+| 3 | 跑 `trace_mainline.py`，本地打印 span 计数 | 屏幕出现 `[trace trace_...] {...}` |
+| 4 | 加上 `custom_span` 业务节点（22.5） | 计数里出现自定义类型 |
+| 5 | 按需接第三方系统（22.6、22.7） | 能替换导出器并看到本地 JSONL |
+
+---
 
 ## 学习目标
 
@@ -13,7 +52,11 @@
 - 能实现一个 `TracingProcessor`，并知道 `add_trace_processor` 与 `set_trace_processors` 的区别。
 - 能排查“trace 缺失 / trace 太长 / trace 泄露敏感数据”三类问题。
 
+---
+
 ## 22.1 两个对象：Trace 与 Span
+
+核心结论：`Trace` 是一次端到端的工作流（workflow），`Span` 是其中一段有起止时间的操作（跨度）。
 
 `Trace` 表示一次端到端的工作流，`Span` 表示其中一段有起止时间的操作。这两个对象的字段设计得极其克制。
 
@@ -24,9 +67,13 @@
 
 层级不靠嵌套对象表达，而是靠 `parent_id` 串起来。每个 span 只记住自己的父节点，父子关系由这一列推出来。
 
-当前 trace 与当前 span 存在 Python 的 `contextvar` 里，所以**并发任务会自动各归各的**。这也是 SDK 敢在 async 环境里默认开启追踪的原因。
+当前 trace 与当前 span 存在 Python 的上下文变量（contextvar）里，所以并发任务会自动各归各的。这也是 SDK 敢在 async 环境里默认开启追踪的原因。
+
+---
 
 ## 22.2 默认 span 树：你什么都没写，但已经记了七种
+
+核心结论：一次 `Runner.run()` 默认就写下七种 span，不用写任何代码，父子关系固定。
 
 一次 `Runner.run()` 默认就会写下七种 span，你不用写任何代码。下面的树是它们固定的父子关系。
 
@@ -43,7 +90,7 @@ trace("Agent workflow")
 
 读这棵树时抓住两个计数规则：task 按 Runner 调用计数，turn 按模型轮次计数。节点数量对不上时，先从这两层往上数。
 
-对应的 `SpanData` 类型与记录内容如下：
+对应的 `SpanData` 类型与记录内容如下。
 
 | span | 数据类 | 记录什么 |
 | --- | --- | --- |
@@ -55,13 +102,15 @@ trace("Agent workflow")
 | 交接 | `HandoffSpanData` | from_agent、to_agent |
 | 护栏 | `GuardrailSpanData` | name、triggered |
 
-除上表七种，还有三类 span。`response_span` 只存 Responses API 的响应对象，`mcp_tools_span` 记录 MCP 工具清单。语音场景另有 `transcription_span`、`speech_span`、`speech_group_span`。这些类型说明一件事：**span 按“可观测的边界”划分，不按模块划分**。
+除上表七种，还有三类 span。`response_span` 只存 Responses API 的响应对象，`mcp_tools_span` 记录 MCP 工具清单。语音场景另有 `transcription_span`、`speech_span`、`speech_group_span`。这些类型说明一件事：span 按“可观测的边界”划分，不按模块划分。
 
 trace 的默认名字是字面量 `Agent workflow`。想改成业务名，用 `RunConfig(workflow_name="Customer support")`；也可以用 `trace()` 把多次 `run()` 包进同一个 trace。
 
-下面这段验证 `trace()` 的嵌套范围：两个 `run()` 是否落在同一棵树下。
+下面这段验证 `trace()` 的嵌套范围：两个 `run()` 是否落在同一棵树下。它是完整脚本，可直接运行。把它存成 `trace_two_steps.py`，放在 SDK 根目录 `openai-agents-python/` 下。前提：第 2 章的模型 key 已配好。
 
 ```python
+import asyncio
+
 from agents import Agent, Runner, trace
 
 
@@ -70,11 +119,27 @@ async def run_two_steps(agent: Agent) -> None:
         draft = await Runner.run(agent, "列出涨价的三条风险")
         critique = await Runner.run(agent, f"反驳这段：{draft.final_output}")
     print(critique.final_output)
+
+
+async def main() -> None:
+    agent = Agent(name="Assistant", instructions="You only respond in haikus.")
+    await run_two_steps(agent)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-两个 `run()` 落在同一个 trace 下，因为 `trace()` 会把当前 trace 压进 contextvar。离开 `with` 块即恢复。预期结果是两个 run 共享一个 `trace_id`，第二轮的输出被打印出来。
+运行它：
 
-如果觉得默认层级太啰嗦，可以只关这两层。长跑任务里 task 与 turn 会撑出几百个节点，下面这一行就够。
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python trace_two_steps.py
+```
+
+两个 `run()` 落在同一个 trace 下，因为 `trace()` 会把当前 trace 压进 contextvar，离开 `with` 块即恢复。预期结果是第二轮的输出被打印出来，两步共享一个 `trace_id`。
+
+如果觉得默认层级太啰嗦，可以只关这两层。长跑任务里 task 与 turn 会撑出几百个节点。这是片段，不是完整脚本：把它嵌到上面脚本的 `main()` 里，在 `Runner.run()` 之前构造 `run_config` 并作为 `run_config=` 传入；`RunConfig` 从 `agents` 导入。
 
 ```python
 from agents import RunConfig
@@ -84,9 +149,13 @@ run_config = RunConfig(tracing={"include_task_and_turn_spans": False})
 
 改完之后 agent、generation、function、handoff、guardrail 都还在，只是少了两层包裹。
 
+---
+
 ## 22.3 开关与敏感数据
 
-tracing 默认开启，关闭方式有三种，粒度各不相同。选哪一种，取决于你要关掉多大范围。
+核心结论：tracing 默认开启，三种关闭方式粒度不同，环境变量只读一次、`set_tracing_disabled()` 优先级最高。
+
+关闭方式有三种，粒度各不相同。选哪一种，取决于你要关掉多大范围。
 
 | 方式 | 生效范围 | 写法 |
 | --- | --- | --- |
@@ -94,11 +163,9 @@ tracing 默认开启，关闭方式有三种，粒度各不相同。选哪一种
 | 全局函数 | 进程级 | `set_tracing_disabled(True)` |
 | 单次运行 | 单次 `run` | `RunConfig(tracing_disabled=True)` |
 
-环境变量的读取是**一次性的**。源码在第一次判断时缓存 `OPENAI_AGENTS_DISABLE_TRACING`，之后再改环境变量不会生效，除非调用过 `set_tracing_disabled()`。
+环境变量的读取是一次性的。源码在第一次判断时缓存 `OPENAI_AGENTS_DISABLE_TRACING`，之后再改环境变量不会生效，除非调用过 `set_tracing_disabled()`。
 
 而 `set_tracing_disabled()` 一旦调用，就压过环境变量。这个优先级顺序在写测试夹具时要记住。
-
-还有一条硬限制：**使用 OpenAI API 的零数据保留（ZDR）组织无法使用 tracing**。这不是配置问题，是合规约束，只能改接第三方处理器。
 
 敏感数据由 `trace_include_sensitive_data` 控制，默认 `True`。
 
@@ -111,11 +178,13 @@ tracing 默认开启，关闭方式有三种，粒度各不相同。选哪一种
 
 关掉之后，Responses 的模型 span 会省略请求与响应。对官方端点，它仍保留 `response_id` 作为关联线索；自定义端点则会把这个 ID 也去掉。这条差异在跨系统对账时很关键。
 
-> 注意：`flush_traces()` 在 disabled 之后**仍然会导出已缓冲数据**。也就是说，“我刚关掉 tracing”不等于“之前的数据不会上传”。真要清理，必须在关闭前就换掉处理器。
+> 注意：`flush_traces()` 在 disabled 之后仍然会导出已缓冲数据。也就是说，“我刚关掉 tracing”不等于“之前的数据不会上传”。真要清理，必须在关闭前就换掉处理器。
+
+---
 
 ## 22.4 trace_id、group_id、workflow_name 与 metadata
 
-四个字段各有分工，混用会让追踪查询变得很难写。
+核心结论：四个字段各有分工，混用会让追踪查询变得很难写。
 
 | 字段 | 粒度 | 典型用途 |
 | --- | --- | --- |
@@ -124,37 +193,69 @@ tracing 默认开启，关闭方式有三种，粒度各不相同。选哪一种
 | `group_id` | 一段会话 | 聊天线程 ID，把多轮 trace 串起来 |
 | `metadata` | 任意键值 | 租户 ID、模型档位、灰度分组等自定义维度 |
 
-`RunConfig` 上四个都能设，`trace()` 也接受同名参数。下面这段同时展示两种写法。
+`RunConfig` 上四个都能设，`trace()` 也接受同名参数。下面这段同时展示两种写法。它是完整脚本：改成 `trace_fields.py` 放在 SDK 根目录运行即可，不发起模型调用，零网络。
 
 ```python
 from agents import RunConfig, gen_trace_id, trace
 
-run_config = RunConfig(
-    workflow_name="Customer support triage",
-    trace_id=gen_trace_id(),
-    group_id="chat_thread_8821",
-    trace_metadata={"tenant": "acme", "plan": "pro"},
-)
 
-with trace("Refund investigation", group_id="chat_thread_8821", metadata={"ticket": "T-4417"}):
-    pass
+def main() -> None:
+    run_config = RunConfig(
+        workflow_name="Customer support triage",
+        trace_id=gen_trace_id(),
+        group_id="chat_thread_8821",
+        trace_metadata={"tenant": "acme", "plan": "pro"},
+    )
+    print("配置已构造：Customer support triage / chat_thread_8821")
+
+    with trace("Refund investigation", group_id="chat_thread_8821", metadata={"ticket": "T-4417"}):
+        pass
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-预期结果是两次运行都被归到同一个会话，且能按租户与工单号检索。
+运行它：
 
-两个实践建议。第一，`trace_id` 只在需要与外部系统对齐时才手动指定，否则让 SDK 生成，避免撞 ID。第二，`group_id` 用**业务主键**（会话 ID、工单 ID），不要用随机值，它存在的唯一意义就是让你能按会话查。
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python trace_fields.py
+```
+
+预期结果是打印出 `配置已构造：Customer support triage / chat_thread_8821`，两次运行都被归到同一个会话，且能按租户与工单号检索。
+
+两个实践建议。第一，`trace_id` 只在需要与外部系统对齐时才手动指定，否则让 SDK 生成，避免撞 ID。第二，`group_id` 用业务主键（会话 ID、工单 ID），不要用随机值，它存在的唯一意义就是让你能按会话查。
+
+---
 
 ## 22.5 自定义 span：把业务节点接进树里
 
-默认 span 只覆盖 SDK 自己的边界，业务节点需要你自己加。库存校验、风控打分、向量检索都落在这些边界之外。
+核心结论：默认 span 只覆盖 SDK 自己的边界，库存校验、风控打分、向量检索这些业务节点需要你自己加。
 
-下面这段给一次 RAG 回答加两个节点，并演示出错时怎么补错误分类。
+下面这段给一次 RAG 回答加两个节点，并演示出错时怎么补错误分类。它是完整脚本，可直接运行。把它存成 `trace_rag.py`，放在 SDK 根目录 `openai-agents-python/` 下。前提：第 2 章模型 key 已配好；`vector_store`、`reranker` 是本脚本内自带的假实现，用来让例子脱离外部服务也能跑。
 
 ```python
-from agents import custom_span, trace
+import asyncio
+
+from agents import Agent, Runner, custom_span, trace
 
 
-async def answer_with_retrieval(agent, question: str) -> str:
+class VectorStore:
+    async def search(self, question: str, top_k: int) -> list[str]:
+        return [f"chunk-{i}" for i in range(top_k)]
+
+
+class Reranker:
+    async def rerank(self, question: str, chunks: list[str]) -> list[str]:
+        return list(reversed(chunks))
+
+
+vector_store = VectorStore()
+reranker = Reranker()
+
+
+async def answer_with_retrieval(agent: Agent, question: str) -> str:
     with trace("RAG answer"):
         with custom_span("retrieve", data={"index": "docs_v3", "top_k": 5}) as span:
             chunks = await vector_store.search(question, top_k=5)
@@ -165,12 +266,29 @@ async def answer_with_retrieval(agent, question: str) -> str:
             except Exception as exc:
                 rerank_span.set_error({"message": str(exc), "data": {"stage": "rerank"}})
                 raise
-        return await agent_run(agent, question, chunks)
+        result = await Runner.run(agent, f"{question}\n参考资料：{chunks}")
+        return result.final_output
+
+
+async def main() -> None:
+    agent = Agent(name="RAG assistant", instructions="You only respond in haikus.")
+    print(await answer_with_retrieval(agent, "解释递归"))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-预期结果是 retrieve 与 rerank 两个节点挂在 `RAG answer` 这棵 trace 下，rerank 失败时带一条结构化错误并继续抛出。
+运行它：
 
-四个关键点如下：
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python trace_rag.py
+```
+
+预期结果是打印一句俳句；若把 `trace_rag.py` 接上本地打印处理器（下一节的 `SpanCounter`），会看到 `retrieve` 与 `rerank` 两个节点挂在 `RAG answer` 这棵 trace 下。rerank 失败时带一条结构化错误并继续抛出。
+
+四个关键点如下。
 
 | 要点 | 说明 |
 | --- | --- |
@@ -183,29 +301,42 @@ async def answer_with_retrieval(agent, question: str) -> str:
 
 同理，`trace(..., disabled=True)` 返回的是一个 no-op trace。代码结构不变，记录为零。
 
+---
+
 ## 22.6 TracingProcessor：把数据接到别处
 
-追踪的高层结构是一条三段式链路。全局 `TraceProvider` 创建 trace 与 span，交给一串 `TracingProcessor`，默认那个是 `BatchTraceProcessor`。它把数据成批塞给 `BackendSpanExporter`，后者默认发往 OpenAI 的 traces ingest 端点。
+核心结论：追踪的高层结构是一条三段式链路，替换处理器要用 `set_trace_processors()`，而不是 `add_trace_processor()`。
+
+全局 `TraceProvider` 创建 trace 与 span，交给一串处理器（processor），默认那个是 `BatchTraceProcessor`。它把数据成批塞给 `BackendSpanExporter`，后者默认发往 OpenAI 的 traces ingest 端点。
 
 `TracingProcessor` 是抽象类，共五个方法：`on_trace_start`、`on_trace_end`、`on_span_start`、`on_span_end`、`shutdown`，外加 `force_flush`。
 
 约束写在基类注释里：方法要线程安全、要快、要自己吞掉异常。因为处理器的失败不该毁掉 Agent 运行。
 
-两个注册函数语义完全不同，这是最常被搞错的地方：
+两个注册函数语义完全不同，这是最常被搞错的地方。
 
 | 函数 | 效果 |
 | --- | --- |
-| `add_trace_processor(p)` | **追加**，默认的 OpenAI 导出器仍在 |
-| `set_trace_processors([p])` | **替换**，不包含默认导出器就不再上报 OpenAI |
+| `add_trace_processor(p)` | 追加，默认的 OpenAI 导出器仍在 |
+| `set_trace_processors([p])` | 替换，不包含默认导出器就不再上报 OpenAI |
 
-下面这个处理器只做一件事：按 trace 汇总 span 类型，在一次运行结束时打印。
+下面这个处理器只做一件事：按 trace 汇总 span 类型，在一次运行结束时打印。它是完整脚本，也是本章主线的验收脚本。把它存成 `trace_mainline.py`，放在 SDK 根目录 `openai-agents-python/` 下。前提：第 2 章模型 key 已配好。
 
 ```python
+import asyncio
+
+from agents import (
+    Agent,
+    Runner,
+    Span,
+    Trace,
+    set_trace_processors,
+    trace,
+    custom_span,
+)
+from agents.tracing import TracingProcessor
 from collections import Counter
 from typing import Any
-
-from agents import Span, Trace, add_trace_processor
-from agents.tracing import TracingProcessor
 
 
 class SpanCounter(TracingProcessor):
@@ -234,19 +365,37 @@ class SpanCounter(TracingProcessor):
         return None
 
 
-add_trace_processor(SpanCounter())
+async def main() -> None:
+    set_trace_processors([SpanCounter()])  # 替换默认导出器，本地打印、不发网络
+    agent = Agent(name="Assistant", instructions="You only respond in haikus.")
+    with trace("Customer support", group_id="chat_8821", metadata={"tenant": "acme"}):
+        with custom_span("validate_input", data={"stage": "pre"}):
+            result = await Runner.run(agent, "Tell me about recursion in programming.")
+    print(result.final_output)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-预期输出形如 `[trace trace_9f2...] {'task': 1, 'turn': 3, 'agent': 3, 'generation': 3, 'function': 2}`。
+运行它：
 
-如果你要自己写导出器，实现的不是 `TracingProcessor`，而是 `TracingExporter.export(items)`。然后包一层批量处理器，下面这段就是一个写 JSONL 的导出器。
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python trace_mainline.py
+```
+
+预期输出形如 `[trace trace_9f2...] {'task': 1, 'turn': 3, 'agent': 3, 'generation': 3, 'function': 2}`，随后打印一句俳句。看到这一行计数，就证明 trace 已被本地处理器捕获，且没有网络上报。
+
+如果你要自己写导出器（exporter），实现的不是 `TracingProcessor`，而是 `TracingExporter.export(items)`，然后包一层批量处理器。下面这段就是一个写 JSONL 的完整脚本，存成 `trace_jsonl.py` 放在 SDK 根目录运行。
 
 ```python
-from typing import Any
+import asyncio
 
-from agents import Span, Trace, set_trace_processors
+from agents import Agent, Runner, Span, Trace, set_trace_processors
 from agents.tracing.processor_interface import TracingExporter
 from agents.tracing.processors import BatchTraceProcessor
+from typing import Any
 
 
 class JsonlExporter(TracingExporter):
@@ -261,17 +410,32 @@ class JsonlExporter(TracingExporter):
                     fh.write(str(payload) + "\n")
 
 
-processor = BatchTraceProcessor(JsonlExporter("traces.jsonl"))
-set_trace_processors([processor])
+async def main() -> None:
+    processor = BatchTraceProcessor(JsonlExporter("traces.jsonl"))
+    set_trace_processors([processor])
+    agent = Agent(name="Assistant", instructions="You only respond in haikus.")
+    result = await Runner.run(agent, "Tell me about recursion in programming.")
+    print(result.final_output)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+运行它：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python trace_jsonl.py
 ```
 
 预期结果是每次导出追加一批 JSON 行到 `traces.jsonl`，且不再有网络上报。
 
-`BatchTraceProcessor` 有四个可调参数，理解它们才能调好延迟与内存的平衡：
+`BatchTraceProcessor` 有四个可调参数，理解它们才能调好延迟与内存的平衡。
 
 | 参数 | 默认 | 含义 |
 | --- | --- | --- |
-| `max_queue_size` | 8192 | 队列上限，满了会**丢弃**新数据并打 warning |
+| `max_queue_size` | 8192 | 队列上限，满了会丢弃新数据并打 warning |
 | `max_batch_size` | 128 | 单批导出条数 |
 | `schedule_delay` | 5.0 | 后台线程检查间隔（秒） |
 | `export_trigger_ratio` | 0.7 | 队列占用超过该比例就立刻导出一批 |
@@ -282,32 +446,40 @@ set_trace_processors([processor])
 
 > 提示：替换处理器要用 `set_trace_processors()`，不是 `add_trace_processor()`。用后者时默认的 OpenAI 导出器还在，你以为“只发到自己的系统”，实际上还发了一份到 OpenAI。
 
+---
+
 ## 22.7 接到第三方系统
 
-生态集成只有两条路径，取决于对方提供什么。
+核心结论：生态集成只有两条路径，脱敏与投递必须在同一个 exporter 内完成。
 
-1. **对方提供 TracingProcessor**：Logfire、AgentOps、Braintrust、Weights & Biases、Langfuse、LangSmith 都属于这一类。按它们的文档注册，通常一行 `set_trace_processors([...])`，或调用它们自己的 instrument 函数。
-2. **对方只接受 OTel 或自定义格式**：自己写 `TracingExporter`，把 `item.export()` 得到的字典转换后发出去。这是最可控的路径，也是唯一能保证脱敏与投递在同一处的路径。
+1. 对方提供 `TracingProcessor`：Logfire、AgentOps、Braintrust、Weights & Biases、Langfuse、LangSmith 都属于这一类。按它们的文档注册，通常一行 `set_trace_processors([...])`，或调用它们自己的 instrument 函数。
+2. 对方只接受 OTel 或自定义格式：自己写 `TracingExporter`，把 `item.export()` 得到的字典转换后发出去。这是最可控的路径，也是唯一能保证脱敏与投递在同一处的路径。
 
-文档的“Redaction before export”一节把这件事说得很重。**处理器是独立观察者**，一个处理器做脱敏、另一个导出，并不能保证导出方拿到的是脱敏后的数据。
+文档的“Redaction before export”一节把这件事说得很重。处理器是独立观察者，一个处理器做脱敏、另一个导出，并不能保证导出方拿到的是脱敏后的数据。
 
-要做脱敏，必须让脱敏与投递在**同一个 exporter 内**完成，并用 `set_trace_processors()` 替掉默认链路。`repo/examples/basic/trace_redaction.py` 正是这个模式的完整实现：它只保留 `object`、`id`、`trace_id`、`parent_id` 四个字段，本地打印，不发任何网络请求。
+要做脱敏，必须让脱敏与投递在同一个 exporter 内完成，并用 `set_trace_processors()` 替掉默认链路。`repo/examples/basic/trace_redaction.py` 正是这个模式的完整实现：它只保留 `object`、`id`、`trace_id`、`parent_id` 四个字段，本地打印，不发任何网络请求。
+
+---
 
 ## 22.8 排障：trace 没了、太长、太脏
 
-排障的第一步是分类，不是猜原因。下表按“你看到什么”给出检查顺序。
+核心结论：排障的第一步是分类，不是猜原因。下表按“你看到什么”给出检查顺序。
 
 | 现象 | 先查什么 | 关键细节 |
 | --- | --- | --- |
 | trace 完全没出现 | 按顺序查四件事：是否被某个开关置为 disabled、`RunConfig(tracing_disabled=True)` 是否在某处写死、组织是否处于 ZDR、是否根本没有 OpenAI key | 默认导出器要往 OpenAI 传，没 key 会 401 |
-| trace 太长或太大 | 三层收缩：关掉 task/turn span、关掉敏感数据、在自建导出器里截断长文本 | 单字段有 100000 字节上限，超出会截断并加后缀，**超长工具输出在追踪里不是原文** |
+| trace 太长或太大 | 三层收缩：关掉 task/turn span、关掉敏感数据、在自建导出器里截断长文本 | 单字段有 100000 字节上限，超出会截断并加后缀，超长工具输出在追踪里不是原文 |
 | trace 里出现不该出现的敏感数据 | 先确认 `trace_include_sensitive_data` 的实际取值（环境变量与代码两处都可能设），再查有没有别的处理器在旁路导出 | 很多人把用户信息塞进 `metadata` 后忘了，而 `metadata` 不受该开关保护 |
 | trace 延迟很久才出现 | 这是 `BatchTraceProcessor` 的正常行为，默认 5 秒一批 | 要即时可见，就在业务单元结束时调 `flush_traces()` |
 | trace 与日志对不上 | 把 `trace.trace_id` 打进自己的日志，用同一个 ID 关联两侧 | `trace()` 返回的对象上有 `trace_id`，`RunResult.trace` 也有 |
 
 接非 OpenAI 模型时，最常见的组合是“关掉 tracing”，或用 `set_tracing_export_api_key()` 单独给追踪配一个 OpenAI key。对时间戳只能猜，对 `trace_id` 才能查。
 
+---
+
 ## 常见坑与排查
+
+按症状查，每条都给出“症状 → 原因 → 修法”。
 
 1. **症状**：导入了 `custom_span`，却发现追踪系统里完全没有这个节点。
    **原因**：没有当前 trace（既没 `with trace(...)`，这次 run 也不是在 trace 内），此时 span 是空操作；或 `trace_include_sensitive_data=False` 后又去找 `data` 内容。
@@ -329,13 +501,17 @@ set_trace_processors([processor])
    **原因**：`trace_id` 格式必须是 `trace_` 加 32 位字母数字，手写容易不合法；或者手写了一个，但那次运行没进 trace。
    **修法**：用 `gen_trace_id()` 生成；把 trace ID 与业务主键一起落库。
 
+---
+
 ## 动手练习
 
-工作目录是 SDK 根目录 `repo/openai-agents-python/`。若 clone 在别处，按自己的目录替换，后文不再重复。
+工作目录是 SDK 根目录 `openai-agents-python/`。若 clone 在别处，按自己的目录替换，后文不再重复。
 
-1. **数一遍 span**：写一个带一个工具、一个 handoff 的最小 workflow，用 22.6 的 `SpanCounter` 打印 span 计数，对照 22.2 的树检查每一项是否都能解释。
+1. **数一遍 span**：把主线的 `trace_mainline.py` 跑起来，确认屏幕出现一行 span 计数；再给它加一个工具和一个 handoff，对照 22.2 的树检查每一项是否都能解释。
 2. **做一次脱敏导出**：仿照 `repo/examples/basic/trace_redaction.py`，写一个只保留 `object`、`id`、`trace_id`、`parent_id` 的 exporter，并用 `set_trace_processors()` 替换默认链路，确认不再有网络上报。
 3. **改造示例**：打开 `repo/examples/basic/agent_lifecycle_example.py`，在 `on_tool_start` 与 `on_tool_end` 之间插入一个 `custom_span("validate_input")`，把工具名与参数长度写进 `data`，观察它挂在哪个父 span 下。
+
+---
 
 ## 本章小结
 
@@ -345,6 +521,8 @@ set_trace_processors([processor])
 - `custom_span(name, data)` 是业务节点的入口，`span.set_error()` 补错误分类。
 - `add_trace_processor` 追加，`set_trace_processors` 替换；脱敏与投递必须同处一个 exporter；`BatchTraceProcessor` 默认 5 秒一批，队列满会丢数据。
 - 排障先分三类：没出现（开关、key、ZDR）、太长（层级与载荷）、太脏（敏感数据与 metadata）。
+
+---
 
 ## 延伸阅读
 

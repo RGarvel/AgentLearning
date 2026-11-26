@@ -4,221 +4,17 @@
 
 `output_type` 就是把这个负债变成资产的开关。它让模型交出的东西不再是一段话，而是一个可校验的对象。
 
-本章从「能传什么类型」一路讲到「失败时到底抛哪个异常」，最后用一个简历解析的例子把它们串起来。读完你会知道：怎么让模型稳定交出可入库的结构化输出（structured output），以及失败时怎么兜底。
+本章给一条主线：把一段简历文本解析成 `Resume` 对象，再通过工具写入人才库。走完你会得到三样东西：一段能直接跑的脚本、一张「哪种类型会被包一层」的对照表、一条「失败时抛哪个异常」的判断规则。后面的 20.1 到 20.7 都在解释这段脚本为什么这么写，以及还能怎么微调。
 
-## 学习目标
+运行环境照第 2 章准备即可，本章不碰 key、base URL 或模型名，只改 `Agent` 的 `output_type` 与工具。第 19 章讲的 Provider 层局部配置也不冲突：那一层决定「谁回答」，这一层决定「答案长什么样」。
 
-- 能说清 `output_type` 接受哪些类型，以及哪些类型会被自动包一层 `response` 键。
-- 能读懂 `AgentOutputSchema` 的五个方法与 strict 模式的四条硬限制。
-- 能判断什么时候必须关掉 strict（并知道代价）。
-- 能区分 `final_output`、`final_output_as()` 与 `AgentOutputSchema.validate_json()` 各自的职责。
-- 能在模型拒答或校验失败时，用 `run_error_handlers` 做可控降级。
-- 能独立写出「简历文本 → 结构化对象 → 工具入库」的完整链路。
+> 路径约定：本机 SDK 目录一律写作 `openai-agents-python/`。课程里的 `repo/xxx` 是逻辑前缀，点击跳 GitHub 上 v0.25.0 的源码，不用真的建 `repo` 目录。若你 clone 到别处，把命令里的 `openai-agents-python` 换成自己的路径即可，后文不再重复。
 
-## 20.1 能传什么：一句话与一张表
-
-`output_type` 接受任何能被 Pydantic `TypeAdapter` 包起来的类型，这是官方文档的原话。这句话的边界比听起来更宽。
-
-| 类型 | 示例 | 是否被包 `response` 键 | 备注 |
-| --- | --- | --- | --- |
-| Pydantic 模型 | `class Resume(BaseModel)` | 否 | 最推荐，schema 可控 |
-| dataclass | `@dataclass class Meta` | 是 | 需要严格 schema 时注意默认值 |
-| TypedDict | `class Meta(TypedDict)` | 是 | 校验后仍是 dict，只能用键访问 |
-| 列表 | `list[Resume]` | 是 | 顶层必须是对象，故被包一层 |
-| 标量 | `int`、`bool` | 是 | 能用但不常见 |
-| `None` / `str` | — | — | 视为纯文本，不启用结构化输出 |
-| `AgentOutputSchemaBase` 实例 | 自定义 schema | 由你决定 | 完全接管解析 |
-
-「包一层 `response` 键」不是实现细节。它会出现在模型的 JSON 里，也会影响你调试时看到的内容。源码 `repo/src/agents/agent_output.py` 的判断只有一行：
-
-```python
-self._is_wrapped = not _is_subclass_of_base_model_or_dict(output_type)
-```
-
-也就是说，只有 Pydantic 模型与 `dict` 子类不包。dataclass、TypedDict、`list[...]` 都会被包成 `{"response": ...}`。
-
-模型看到的 schema 就是这个包装后的对象。`validate_json()` 会在最后把 `response` 拆出来还给你，所以业务代码里你拿到的仍然是 `list[Resume]`，不是包装字典。
-
-## 20.2 AgentOutputSchema：五个方法定义的契约
-
-`AgentOutputSchemaBase` 是抽象基类，契约只有五件事。
-
-| 方法 | 作用 | 什么时候被调用 |
-| --- | --- | --- |
-| `is_plain_text()` | 是否纯文本 | 每轮决定要不要走 JSON 校验 |
-| `name()` | 类型名，用于日志与 trace | 构造时与调试时 |
-| `json_schema()` | 发给模型的 JSON Schema | 纯文本时调用会抛 `UserError` |
-| `is_strict_json_schema()` | 是否 strict | 由适配器决定请求形态 |
-| `validate_json(json_str)` | 解析并校验，失败抛 `ModelBehaviorError` | 拿到最终文本后 |
-
-`output_type` 到 schema 的转换发生在 `repo/src/agents/run_internal/turn_preparation.py`。
-
-```python
-def get_output_schema(agent: Agent[Any]) -> AgentOutputSchemaBase | None:
-    if agent.output_type is None or agent.output_type is str:
-        return None
-    elif isinstance(agent.output_type, AgentOutputSchemaBase):
-        return agent.output_type
-    return AgentOutputSchema(agent.output_type)
-```
-
-三种输入、三种命运。`None` 与 `str` 直接不启用；传自定义 schema 实例则原样使用（`repo/examples/basic/non_strict_output_type.py` 就是这条路）；传类型则默认 `strict_json_schema=True`。
-
-自定义 schema 值得单独说一句：它是唯一能「接管解析后处理」的入口。模型吐出的数组需要去重、时间字段需要归一化、金额需要乘 100 存整数，这些都能塞进 `validate_json()`。
-
-代价是你也要自己承担全部校验责任。SDK 不会在它外面再补一层。团队里常见的分工是：通用结构用 `AgentOutputSchema`；只有确实存在「模型输出的形状与业务对象不一致」时，才写自定义 schema，并给它配单元测试。
-
-## 20.3 strict 模式的四条硬限制
-
-strict 不是「更严格的校验」，而是一组**会改变 schema 结构**的转换规则。`repo/src/agents/strict_schema.py` 做四件事。
-
-1. **所有属性都进 `required`**。源码里 `json_schema["required"] = list(properties.keys())`，没有「可选字段」这回事。想表达可选，只能用 `Optional[T]`（schema 里变成 nullable），让模型显式给 `null`。
-2. **`additionalProperties: false`**。对象不允许出现未声明字段；如果你给了允许任意键的 dict schema，会直接 `UserError`。
-3. **根必须是不可为 null 的 object**。根用 `anyOf` 会被拒绝；`list` 之所以能用，是因为它被包进了 `response` 键。
-4. **`oneOf` 会被改写成 `anyOf`**。因为结构化输出在嵌套上下文里不支持前者。
-
-不满足这些条件的类型，会在**构造 Agent 时**就抛 `UserError`，不是等模型返回才炸。
-
-```text
-Strict JSON schema is enabled, but the output type is not valid.
-Either make the output type strict, or wrap your type with
-AgentOutputSchema(YourType, strict_json_schema=False)
-```
-
-预期结果是：构造那一行就报错，错误信息点名要求改用 strict 类型，或显式关掉 strict。
-
-典型触发者是「带任意键的 dict」与「字段有非 None 默认值的 dataclass」。后者尤其隐蔽。`source: str = "manual"` 这种写法在 strict 下会被要求显式提供，模型可能照做，但你的业务代码以为可以省略。
-
-关掉 strict 的写法与代价如下。
-
-```python
-from agents import Agent, AgentOutputSchema
-
-agent = Agent(
-    name="Assistant",
-    output_type=AgentOutputSchema(JokeBook, strict_json_schema=False),
-)
-# 代价：SDK 不再保证 JSON 合法，validate_json 可能抛 ModelBehaviorError
-```
-
-预期结果是：能构造成功，但 SDK 不再保证 JSON 合法，`validate_json()` 可能抛 `ModelBehaviorError`。
-
-> 注意：strict 保证的是「JSON 结构合法」，不是「内容正确」。字段值编造、数字量级错误，strict 一概不管。那属于第 23 章评估与第 14 章护栏的职责。
-
-## 20.4 final_output 已经是对象，final_output_as 只做类型窄化
-
-`final_output` 在 `output_type` 生效时已经是真正的 Python 对象，不要再对它 `json.loads()`。这是新手最常绕的弯路。
-
-| 场景 | `final_output` 的类型 |
+| 课程里写的（可点击） | 你本机打开的文件 |
 | --- | --- |
-| 无 `output_type` | `str` |
-| `output_type=Resume` | `Resume` 实例 |
-| `output_type=list[Resume]` | `list[Resume]` |
-| `output_type` 生效但运行被中断 | `None` |
+| `repo/src/agents/agent_output.py` | `openai-agents-python/src/agents/agent_output.py` |
 
-`final_output_as(cls, raise_if_incorrect_type=False)` 的作用只是给静态类型检查器一个交代。默认情况下它**不校验**，只在 `raise_if_incorrect_type=True` 时做一次 `isinstance`。
-
-```python
-resume = result.final_output_as(Resume)  # 纯类型转换，不做检查
-resume = result.final_output_as(Resume, raise_if_incorrect_type=True)  # 类型不符抛 TypeError
-```
-
-预期结果是：第一行原样返回，第二行在类型不符时抛 `TypeError`。
-
-为什么要它？因为 `final_output` 的类型标注是 `Any`。交接（handoff）可能让另一个 Agent 收尾，SDK 无法静态推断最终类型。它解决的是「编辑器不知道类型」，不是「运行时可能拿错类型」。
-
-排障时也别只盯 `final_output`。结构化输出出问题时，真正有价值的是两处原始材料。`result.raw_responses[-1].output` 里是模型实际吐出的文本；`result.new_items` 里最后一条 `MessageOutputItem` 说明 SDK 把它归到了哪一轮。
-
-先看这两个，再决定是改 schema、改 prompt，还是加降级处理器。
-
-## 20.5 嵌套与可选字段：怎么写才不踩 strict
-
-嵌套与可选字段只有一条主线：能显式给 `null`，就不要留「字段缺失」。下面这份模型是后文例子的基础。
-
-```python
-from pydantic import BaseModel, Field
-
-
-class Project(BaseModel):
-    name: str
-    role: str
-    highlights: list[str] = Field(default_factory=list)
-
-
-class Resume(BaseModel):
-    candidate_name: str
-    years_of_experience: float
-    skills: list[str]
-    current_company: str | None = None
-    projects: list[Project] = Field(default_factory=list)
-    expected_salary: int | None = None
-```
-
-预期结果是：这份 `Resume` 能通过 strict 校验，`projects` 与 `expected_salary` 都可缺省为 null 或空列表。
-
-要点三条。第一，`Optional` 字段在 schema 里是 nullable，模型会明确输出 `null`，这比「字段可能缺失」可靠。
-
-第二，嵌套模型会被递归转成 strict，`properties` 里每个子 schema 都会走同一套规则。
-
-第三，`Field(default_factory=list)` 在 strict 下依然会进 `required`。模型必须给出这个字段，只是值可以是空列表。
-
-如果你需要模型「尽量少给字段」，正确做法不是依赖 strict 的默认值，而是把提示词与字段设计对齐。要么给 `Optional`，要么让模型输出空集合。
-
-## 20.6 与 tools 同时使用：两条输出通道
-
-`output_type` 与 `tools` 完全可以同时开，但两条输出通道的规则不同。
-
-运行循环的行为是：模型可以连续调用工具，每一轮的工具结果回到上下文；**只有最后一条 assistant 消息**会被 `validate_json()` 处理。这条消息通常出现在模型认为「信息够了」之后。
-
-有一条反直觉的边界。如果 `tool_use_behavior` 让工具输出直接成为最终结果（`stop_on_first_tool`，或 `ToolsToFinalOutputFunction` 返回 `is_final_output=True`），那么 `final_output` 就是工具返回值，**不会**再过 `output_type` 的 schema 校验。源码 `_maybe_finalize_from_tool_results()` 里只在纯文本场景做 `str()` 转换，没有 `validate_json` 调用。
-
-> 提示：想保证「工具直出也符合结构」，让工具自己返回 Pydantic 对象，或在 `ToolsToFinalOutputFunction` 里先校验再返回。不要假设 `output_type` 会兜住它。
-
-还有一个协作层面的细节。同时开工具与 `output_type` 时，instructions 里要明确「先取数据、再给结论」。否则模型很容易只输出一个空壳对象（字段全填默认值）就收工。
-
-结构化输出把「形状」约束住了，但「先做哪一步」仍然只能靠提示词和工具描述来编排。这也是第 7 章反复强调工具 docstring 要写清触发条件的原因。
-
-## 20.7 模型拒答与校验失败：三个异常，三种处置
-
-结构化输出失败的场景只有三类，每一类都有明确出口。
-
-| 现象 | 异常 | 触发点 |
-| --- | --- | --- |
-| 模型拒绝回答（安全策略） | `ModelRefusalError` | 最后一条消息带 `refusal` 字段 |
-| JSON 不合法或类型不符 | `ModelBehaviorError` | `AgentOutputSchema.validate_json()` |
-| 拿不到任何文本 | 先走 `NextStepRunAgain` | 模型只回了工具调用或空内容 |
-
-三者都可以用 `Runner.run(..., error_handlers=...)` 接管。`RunErrorHandlers` 只认三个键：`max_turns`、`model_refusal`、`invalid_final_output`。
-
-下面这段给 `invalid_final_output` 挂一个降级处理器，验证「校验失败也能返回可控结果」。
-
-```python
-from agents import Agent, RunErrorHandlerInput, RunErrorHandlers, RunErrorHandlerResult, Runner
-
-
-def on_invalid_output(input: RunErrorHandlerInput) -> RunErrorHandlerResult | None:
-    # 降级：返回一个保守的默认对象，并让它不进历史
-    return RunErrorHandlerResult(
-        final_output=Resume(
-            candidate_name="unknown",
-            years_of_experience=0.0,
-            skills=[],
-        ),
-        include_in_history=False,
-    )
-
-
-handlers: RunErrorHandlers = {"invalid_final_output": on_invalid_output}
-result = await Runner.run(agent, resume_text, error_handlers=handlers)
-```
-
-预期结果是：校验失败时返回一个字段保守的 `Resume`，并且这条兜底输出不会写进历史。
-
-`RunErrorHandlerInput` 里有 `error`、`context`、`run_data`（含 `new_items`、`raw_responses`、`last_agent`），足够你打日志或做局部重试。返回 `None` 表示「不处理」，SDK 会照原样抛出。这也是默认行为，别把降级写成默认。
-
-## 20.8 完整例子：简历解析 → 结构化 JSON → 入库
-
-这个例子要验证两件事。模型先调工具拿到岗位要求，再输出符合 `Resume` 的对象。入库动作发生在工具里，而不是在拿到 `final_output` 之后。
+**主线脚本：简历文本 → 结构化对象 → 工具入库。** 这段验证「模型先调工具拿岗位要求，再输出符合 `Resume` 的对象，入库发生在工具里」。把它存成 `resume_pipeline.py`，放在 SDK 根目录 `openai-agents-python/` 下，配好第 2 章的环境后就能跑。
 
 ```python
 import asyncio
@@ -289,7 +85,14 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-预期输出如下（示意，模型措辞会浮动）：
+运行它：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python resume_pipeline.py
+```
+
+预期输出如下（示意，模型措辞会浮动）。看到 JSON 对象与「已入库条数： 1」，说明主线跑通了，这是本章的总验收点。
 
 ```text
 {
@@ -304,7 +107,345 @@ if __name__ == "__main__":
 已入库条数： 1
 ```
 
-四个关键行值得逐一对照。
+## 学习目标
+
+- 能独立跑通开篇的主线脚本，说出「入库为什么放在工具里」。
+- 能说清 `output_type` 接受哪些类型，以及哪些类型会被自动包一层 `response` 键。
+- 能读懂 `AgentOutputSchema` 的五个方法与 strict 模式的四条硬限制。
+- 能判断什么时候必须关掉 strict（并知道代价）。
+- 能区分 `final_output`、`final_output_as()` 与 `AgentOutputSchema.validate_json()` 各自的职责。
+- 能在模型拒答或校验失败时，用 `run_error_handlers` 做可控降级。
+
+---
+
+## 20.1 能传什么：一句话与一张表
+
+`output_type` 接受任何能被 Pydantic `TypeAdapter` 包起来的类型，这是官方文档的原话。这句话的边界比听起来更宽。
+
+| 类型 | 示例 | 是否被包 `response` 键 | 备注 |
+| --- | --- | --- | --- |
+| Pydantic 模型 | `class Resume(BaseModel)` | 否 | 最推荐，schema 可控 |
+| dataclass | `@dataclass class Meta` | 是 | 需要严格 schema 时注意默认值 |
+| TypedDict | `class Meta(TypedDict)` | 是 | 校验后仍是 dict，只能用键访问 |
+| 列表 | `list[Resume]` | 是 | 顶层必须是对象，故被包一层 |
+| 标量 | `int`、`bool` | 是 | 能用但不常见 |
+| `None` / `str` | — | — | 视为纯文本，不启用结构化输出 |
+| `AgentOutputSchemaBase` 实例 | 自定义 schema | 由你决定 | 完全接管解析 |
+
+「包一层 `response` 键」不是实现细节。它会出现在模型的 JSON 里，也会影响你调试时看到的内容。源码 `repo/src/agents/agent_output.py` 的判断只有一行。
+
+下面这行是源码摘录，不是可运行脚本。它嵌在 `repo/src/agents/agent_output.py` 的 `AgentOutputSchema.__init__()` 里，前置变量 `output_type` 由构造时传入。
+
+```python
+self._is_wrapped = not _is_subclass_of_base_model_or_dict(output_type)
+```
+
+也就是说，只有 Pydantic 模型与 `dict` 子类不包。dataclass、TypedDict、`list[...]` 都会被包成 `{"response": ...}`。
+
+模型看到的 schema 就是这个包装后的对象。`validate_json()` 会在最后把 `response` 拆出来还给你，所以业务代码里你拿到的仍然是 `list[Resume]`，不是包装字典。
+
+---
+
+## 20.2 AgentOutputSchema：五个方法定义的契约
+
+`AgentOutputSchemaBase` 是抽象基类，契约只有五件事。
+
+| 方法 | 作用 | 什么时候被调用 |
+| --- | --- | --- |
+| `is_plain_text()` | 是否纯文本 | 每轮决定要不要走 JSON 校验 |
+| `name()` | 类型名，用于日志与 trace | 构造时与调试时 |
+| `json_schema()` | 发给模型的 JSON Schema | 纯文本时调用会抛 `UserError` |
+| `is_strict_json_schema()` | 是否 strict | 由适配器决定请求形态 |
+| `validate_json(json_str)` | 解析并校验，失败抛 `ModelBehaviorError` | 拿到最终文本后 |
+
+`output_type` 到 schema 的转换发生在 `repo/src/agents/run_internal/turn_preparation.py`。下面是源码摘录，不是可运行脚本，前置变量 `agent` 由运行循环传入。
+
+```python
+def get_output_schema(agent: Agent[Any]) -> AgentOutputSchemaBase | None:
+    if agent.output_type is None or agent.output_type is str:
+        return None
+    elif isinstance(agent.output_type, AgentOutputSchemaBase):
+        return agent.output_type
+    return AgentOutputSchema(agent.output_type)
+```
+
+三种输入、三种命运。`None` 与 `str` 直接不启用；传自定义 schema 实例则原样使用（`repo/examples/basic/non_strict_output_type.py` 就是这条路）；传类型则默认 `strict_json_schema=True`。
+
+自定义 schema 值得单独说一句：它是唯一能「接管解析后处理」的入口。模型吐出的数组需要去重、时间字段需要归一化、金额需要乘 100 存整数，这些都能塞进 `validate_json()`。
+
+代价是你也要自己承担全部校验责任。SDK 不会在它外面再补一层。团队里常见的分工是：通用结构用 `AgentOutputSchema`；只有确实存在「模型输出的形状与业务对象不一致」时，才写自定义 schema，并给它配单元测试。
+
+---
+
+## 20.3 strict 模式的四条硬限制
+
+strict 不是「更严格的校验」，而是一组**会改变 schema 结构**的转换规则。`repo/src/agents/strict_schema.py` 做四件事。
+
+1. **所有属性都进 `required`**。源码里 `json_schema["required"] = list(properties.keys())`，没有「可选字段」这回事。想表达可选，只能用 `Optional[T]`（schema 里变成 nullable），让模型显式给 `null`。
+2. **`additionalProperties: false`**。对象不允许出现未声明字段；如果你给了允许任意键的 dict schema，会直接 `UserError`。
+3. **根必须是不可为 null 的 object**。根用 `anyOf` 会被拒绝；`list` 之所以能用，是因为它被包进了 `response` 键。
+4. **`oneOf` 会被改写成 `anyOf`**。因为结构化输出在嵌套上下文里不支持前者。
+
+不满足这些条件的类型，会在**构造 Agent 时**就抛 `UserError`，不是等模型返回才炸。
+
+```text
+Strict JSON schema is enabled, but the output type is not valid.
+Either make the output type strict, or wrap your type with
+AgentOutputSchema(YourType, strict_json_schema=False)
+```
+
+预期结果是：构造那一行就报错，错误信息点名要求改用 strict 类型，或显式关掉 strict。
+
+典型触发者是「带任意键的 dict」与「字段有非 None 默认值的 dataclass」。后者尤其隐蔽。`source: str = "manual"` 这种写法在 strict 下会被要求显式提供，模型可能照做，但你的业务代码以为可以省略。
+
+关掉 strict 的写法与代价如下。下面这段验证「关掉 strict 能构造成功，但 SDK 不再保证 JSON 合法」。把它存成 `non_strict_output.py`，放在 SDK 根目录 `openai-agents-python/` 下，配好环境后运行。
+
+```python
+import asyncio
+
+from pydantic import BaseModel
+
+from agents import Agent, AgentOutputSchema, Runner
+
+
+class JokeBook(BaseModel):
+    setup: str
+    punchline: str
+
+
+async def main() -> None:
+    agent = Agent(
+        name="Assistant",
+        instructions="讲一个笑话。",
+        output_type=AgentOutputSchema(JokeBook, strict_json_schema=False),
+    )
+    result = await Runner.run(agent, "讲个程序员笑话")
+    print(result.final_output)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+运行它：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python non_strict_output.py
+```
+
+预期结果是：能构造成功并打印出笑话对象，但 SDK 不再保证 JSON 合法，`validate_json()` 可能抛 `ModelBehaviorError`。
+
+> 注意：strict 保证的是「JSON 结构合法」，不是「内容正确」。字段值编造、数字量级错误，strict 一概不管。那属于第 23 章评估与第 14 章护栏的职责。
+
+---
+
+## 20.4 final_output 已经是对象，final_output_as 只做类型窄化
+
+`final_output` 在 `output_type` 生效时已经是真正的 Python 对象，不要再对它 `json.loads()`。这是新手最常绕的弯路。
+
+| 场景 | `final_output` 的类型 |
+| --- | --- |
+| 无 `output_type` | `str` |
+| `output_type=Resume` | `Resume` 实例 |
+| `output_type=list[Resume]` | `list[Resume]` |
+| `output_type` 生效但运行被中断 | `None` |
+
+`final_output_as(cls, raise_if_incorrect_type=False)` 的作用只是给静态类型检查器一个交代。默认情况下它**不校验**，只在 `raise_if_incorrect_type=True` 时做一次 `isinstance`。
+
+下面是片段，不是完整脚本。它嵌到开篇 `resume_pipeline.py` 的 `main()` 里、紧跟在 `result = await Runner.run(...)` 之后即可。前置变量 `result` 来自那次 `Runner.run()` 的返回，`Resume` 由该文件顶部定义的 Pydantic 模型提供，无需另建文件。
+
+```python
+resume = result.final_output_as(Resume)  # 纯类型转换，不做检查
+resume = result.final_output_as(Resume, raise_if_incorrect_type=True)  # 类型不符抛 TypeError
+```
+
+预期结果是：第一行原样返回，第二行在类型不符时抛 `TypeError`。
+
+为什么要它？因为 `final_output` 的类型标注是 `Any`。交接（handoff）可能让另一个 Agent 收尾，SDK 无法静态推断最终类型。它解决的是「编辑器不知道类型」，不是「运行时可能拿错类型」。
+
+排障时也别只盯 `final_output`。结构化输出出问题时，真正有价值的是两处原始材料。`result.raw_responses[-1].output` 里是模型实际吐出的文本；`result.new_items` 里最后一条 `MessageOutputItem` 说明 SDK 把它归到了哪一轮。
+
+先看这两个，再决定是改 schema、改 prompt，还是加降级处理器。
+
+---
+
+## 20.5 嵌套与可选字段：怎么写才不踩 strict
+
+嵌套与可选字段只有一条主线：能显式给 `null`，就不要留「字段缺失」。下面这份模型是后文例子的基础。把它存成 `resume_schema.py`，放在 SDK 根目录 `openai-agents-python/` 下，不需要 key 就能跑。
+
+```python
+from pydantic import BaseModel, Field
+
+
+class Project(BaseModel):
+    name: str
+    role: str
+    highlights: list[str] = Field(default_factory=list)
+
+
+class Resume(BaseModel):
+    candidate_name: str
+    years_of_experience: float
+    skills: list[str]
+    current_company: str | None = None
+    projects: list[Project] = Field(default_factory=list)
+    expected_salary: int | None = None
+
+
+if __name__ == "__main__":
+    print(Resume.model_json_schema())
+```
+
+运行它：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python resume_schema.py
+```
+
+预期结果是打印出 JSON Schema，`projects` 与 `expected_salary` 出现在 `required` 里但类型是 nullable，说明这份 `Resume` 能通过 strict 校验，两者可缺省为 null 或空列表。
+
+要点三条。第一，`Optional` 字段在 schema 里是 nullable，模型会明确输出 `null`，这比「字段可能缺失」可靠。
+
+第二，嵌套模型会被递归转成 strict，`properties` 里每个子 schema 都会走同一套规则。
+
+第三，`Field(default_factory=list)` 在 strict 下依然会进 `required`。模型必须给出这个字段，只是值可以是空列表。
+
+如果你需要模型「尽量少给字段」，正确做法不是依赖 strict 的默认值，而是把提示词与字段设计对齐。要么给 `Optional`，要么让模型输出空集合。
+
+---
+
+## 20.6 与 tools 同时使用：两条输出通道
+
+`output_type` 与 `tools` 完全可以同时开，但两条输出通道的规则不同。
+
+运行循环的行为是：模型可以连续调用工具，每一轮的工具结果回到上下文；**只有最后一条 assistant 消息**会被 `validate_json()` 处理。这条消息通常出现在模型认为「信息够了」之后。
+
+有一条反直觉的边界。如果 `tool_use_behavior` 让工具输出直接成为最终结果（`stop_on_first_tool`，或 `ToolsToFinalOutputFunction` 返回 `is_final_output=True`），那么 `final_output` 就是工具返回值，**不会**再过 `output_type` 的 schema 校验。源码 `_maybe_finalize_from_tool_results()` 里只在纯文本场景做 `str()` 转换，没有 `validate_json` 调用。
+
+> 提示：想保证「工具直出也符合结构」，让工具自己返回 Pydantic 对象，或在 `ToolsToFinalOutputFunction` 里先校验再返回。不要假设 `output_type` 会兜住它。
+
+还有一个协作层面的细节。同时开工具与 `output_type` 时，instructions 里要明确「先取数据、再给结论」。否则模型很容易只输出一个空壳对象（字段全填默认值）就收工。
+
+结构化输出把「形状」约束住了，但「先做哪一步」仍然只能靠提示词和工具描述来编排。这也是第 7 章反复强调工具 docstring 要写清触发条件的原因。
+
+---
+
+## 20.7 模型拒答与校验失败：三个异常，三种处置
+
+结构化输出失败的场景只有三类，每一类都有明确出口。
+
+| 现象 | 异常 | 触发点 |
+| --- | --- | --- |
+| 模型拒绝回答（安全策略） | `ModelRefusalError` | 最后一条消息带 `refusal` 字段 |
+| JSON 不合法或类型不符 | `ModelBehaviorError` | `AgentOutputSchema.validate_json()` |
+| 拿不到任何文本 | 先走 `NextStepRunAgain` | 模型只回了工具调用或空内容 |
+
+三者都可以用 `Runner.run(..., error_handlers=...)` 接管。`RunErrorHandlers` 只认三个键：`max_turns`、`model_refusal`、`invalid_final_output`。
+
+下面这段验证「校验失败也能返回可控结果」。它是片段，不是完整脚本：把它嵌到开篇 `resume_pipeline.py` 顶部，并把 `main()` 里的 `Runner.run(...)` 换成末尾那一行即可。前置变量 `Resume` 来自该文件顶部，`resume_text` 就是文件里的 `RESUME_TEXT`。
+
+```python
+from agents import Agent, RunErrorHandlerInput, RunErrorHandlers, RunErrorHandlerResult, Runner
+
+
+def on_invalid_output(input: RunErrorHandlerInput) -> RunErrorHandlerResult | None:
+    # 降级：返回一个保守的默认对象，并让它不进历史
+    return RunErrorHandlerResult(
+        final_output=Resume(
+            candidate_name="unknown",
+            years_of_experience=0.0,
+            skills=[],
+        ),
+        include_in_history=False,
+    )
+
+
+handlers: RunErrorHandlers = {"invalid_final_output": on_invalid_output}
+result = await Runner.run(agent, resume_text, error_handlers=handlers)
+```
+
+预期结果是：校验失败时返回一个字段保守的 `Resume`，并且这条兜底输出不会写进历史。
+
+`RunErrorHandlerInput` 里有 `error`、`context`、`run_data`（含 `new_items`、`raw_responses`、`last_agent`），足够你打日志或做局部重试。返回 `None` 表示「不处理」，SDK 会照原样抛出。这也是默认行为，别把降级写成默认。
+
+---
+
+## 20.8 完整例子：简历解析 → 结构化 JSON → 入库
+
+开篇的 `resume_pipeline.py` 就是这一节，原样贴在这里方便逐行对照。它验证两件事：模型先调工具拿到岗位要求，再输出符合 `Resume` 的对象。入库动作发生在工具里，而不是在拿到 `final_output` 之后。
+
+```python
+import asyncio
+import json
+
+from pydantic import BaseModel, Field
+
+from agents import Agent, Runner
+from agents.decorators import tool
+
+
+class Project(BaseModel):
+    name: str
+    role: str
+    highlights: list[str]
+
+
+class Resume(BaseModel):
+    candidate_name: str
+    years_of_experience: float
+    skills: list[str]
+    current_company: str | None = None
+    projects: list[Project] = Field(default_factory=list)
+
+
+SAVED: list[Resume] = []
+
+
+@tool
+def save_resume(resume: Resume) -> str:
+    """把解析后的简历写入人才库。"""
+    SAVED.append(resume)
+    return f"saved:{resume.candidate_name}:{len(SAVED)}"
+
+
+@tool
+def job_requirements(job_id: str) -> str:
+    """返回岗位的硬性要求。"""
+    return "backend: Python 3.10+, 5 年以上, 有高并发经验"
+
+
+agent = Agent(
+    name="Resume parser",
+    instructions=(
+        "你负责把简历文本解析成结构化数据。"
+        "先调用 job_requirements 了解岗位，再调用 save_resume 入库，最后输出解析结果。"
+    ),
+    tools=[job_requirements, save_resume],
+    output_type=Resume,
+)
+
+
+RESUME_TEXT = """
+张伟，8 年后端经验，现任某支付公司高级工程师。
+主导过日均 2 亿请求的网关重构，QPS 从 8k 提到 24k。
+技能：Python、Go、Kafka、PostgreSQL。
+"""
+
+
+async def main() -> None:
+    result = await Runner.run(agent, RESUME_TEXT)
+    resume = result.final_output_as(Resume, raise_if_incorrect_type=True)
+    print(json.dumps(resume.model_dump(), ensure_ascii=False, indent=2))
+    print("已入库条数：", len(SAVED))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+运行命令与预期输出见本章开头，这里不再重复。四个关键行值得逐一对照。
 
 | 关键行 | 作用 |
 | --- | --- |
@@ -317,7 +458,11 @@ if __name__ == "__main__":
 
 而 `final_output` 之后写库失败，只能由你的应用代码自己重试，且此时会话状态已经推进。副作用越靠近循环内部，重试语义越清晰。这也是第 7 章「工具要幂等」的实际原因。
 
+---
+
 ## 常见坑与排查
+
+按症状查，每条都给出「症状 → 原因 → 修法」。
 
 1. **症状**：`Agent(...)` 构造时报 `UserError: Strict JSON schema is enabled, but the output type is not valid`。
    **原因**：类型里有 `dict[str, Any]`、非 None 默认值、根级 `anyOf`，或额外的 `additionalProperties`。
@@ -339,27 +484,34 @@ if __name__ == "__main__":
    **原因**：这是设计行为，非 BaseModel 类型会被包成 `{"response": [...]}`。
    **修法**：不要自己再包一层，`validate_json()` 已经拆过了。写 prompt 时也别让模型「输出数组」，要按 schema 说话。
 
+---
+
 ## 动手练习
 
-下面三项都在 SDK 根目录里做。若仓库 clone 在别处（目录名可能就叫 repo），把注释里的路径整段换成自己的即可。
+下面三项都在 SDK 根目录里做。若仓库 clone 在别处，把 `openai-agents-python` 换成自己的路径即可。
 
 ```bash
-# 工作目录：repo/openai-agents-python/（SDK 根目录）
-cd repo/openai-agents-python
+# 工作目录：openai-agents-python/（SDK 根目录）
+ls pyproject.toml
 ```
 
 1. **观察包装**：用 `AgentOutputSchema(list[Resume])` 打印 `json_schema()`，再用 `AgentOutputSchema(Resume)` 打印一次，对比顶层 `properties` 的键名差异。
-2. **制造失败**：把 `Resume.years_of_experience` 改成 `int`，喂一段含「8.5 年」的文本，看默认抛出什么异常；再加 `invalid_final_output` 处理器，观察返回结果与 `run_data.raw_responses`。
+2. **制造失败**：把 `resume_pipeline.py` 里 `Resume.years_of_experience` 改成 `int`，喂一段含「8.5 年」的文本，看默认抛出什么异常；再加 `invalid_final_output` 处理器，观察返回结果与 `run_data.raw_responses`。
 3. **改造示例**：打开 `repo/examples/basic/non_strict_output_type.py`，把其中的 `CustomOutputSchema` 换成一个「只保留前 3 条 joke」的自定义 schema，体会 `validate_json()` 里做后处理的自由度。
+
+---
 
 ## 本章小结
 
+- 主线脚本 `resume_pipeline.py` 把简历解析成 `Resume` 并入库；入库放在工具里，重试语义最清晰。
 - `output_type` 接受任何 Pydantic `TypeAdapter` 可包装的类型；非 BaseModel 会被包成 `{"response": ...}`。
 - `AgentOutputSchema` 的契约是五个方法：`is_plain_text`、`name`、`json_schema`、`is_strict_json_schema`、`validate_json`。
 - strict 会把所有属性设为 required、关闭 `additionalProperties`、要求根为 object、把 `oneOf` 改成 `anyOf`。
 - `final_output` 已是对象；`final_output_as()` 只做类型窄化，`raise_if_incorrect_type=True` 才真正检查。
 - 工具直出的 `final_output` 不走 `output_type` 校验，这是最隐蔽的边界。
 - 失败出口三个：`ModelRefusalError`（拒答）、`ModelBehaviorError`（校验失败）、空输出重跑一轮；对应的 `error_handlers` 键是 `max_turns`、`model_refusal`、`invalid_final_output`。
+
+---
 
 ## 延伸阅读
 

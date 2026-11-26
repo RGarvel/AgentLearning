@@ -1,10 +1,14 @@
 # 第9章 MCP 协议集成
 
-第 8 章的托管工具是"OpenAI 替你调工具"，工具由平台提供。真实项目里更多的工具在**别人那里**：公司内部的工单系统、第三方的 GitHub、你自己写的文件服务。
+第 8 章的托管工具是"OpenAI 替你调工具"，工具由平台提供。真实项目里更多的工具在别人那里：公司内部的工单系统、第三方的 GitHub、你自己写的文件服务。
 
-把它们一个个包成 `@tool` 当然可以，但那意味着每接一个系统就写一遍适配层。MCP（Model Context Protocol）解决的正是这件事：用一个协议把"工具提供方"和"Agent 运行方"解耦。
+把它们一个个包成 `@tool` 当然可以，但那意味着每接一个系统就写一遍适配层。模型上下文协议（Model Context Protocol, MCP）解决的正是这件事：用一个协议把"工具提供方"和"Agent 运行方"解耦。
 
 这一章讲清 SDK 支持的三条传输、生命周期管理，以及最容易出错的审批与命名。
+
+先定一条默认主线：第九节用 stdio 接官方 filesystem server，是验证"环境是否就绪"的最短路径。把它跑通后，其余传输、GitHub、prompts、预取都按"可选微调"回来看，不必一次全试。
+
+---
 
 ## 学习目标
 
@@ -13,12 +17,15 @@
 - 能正确管理 server 的 `connect/cleanup`，并在多 server 场景用 `MCPServerManager`。
 - 能配置 `mcp_config` 的三个开关，并解释 `include_server_in_tool_names` 解决什么问题。
 - 能判断本地 MCP 服务器与 `HostedMCPTool` 的边界，并为危险工具加上审批。
+- 能把示例存成脚本、起好对应服务端、跑起来并说出预期输出。
+
+---
 
 ## 一、MCP 是什么，不是什么
 
 MCP 是一个开放协议，只规定"客户端如何发现工具、如何调用工具、结果长什么样"。它不规定模型，也不规定 Agent 循环，更不绑定某家厂商。
 
-SDK 里的一切，包括 `MCPServerStdio`、`MCPUtil`、`HostedMCPTool`，都只是这个协议的**客户端实现**。
+SDK 里的一切，包括 `MCPServerStdio`、`MCPUtil`、`HostedMCPTool`，都只是这个协议的客户端实现。
 
 安全上还有几条硬规矩。只连可信 server；给最小权限的凭据；把访问令牌放在 `Authorization` 头而不是 URL 里，因为 URL 会进日志和 trace；对敏感操作强制审批。这些不是"最佳实践建议"，而是"出了事能不能追责"的分界线。
 
@@ -30,6 +37,8 @@ SDK 里的一切，包括 `MCPServerStdio`、`MCPUtil`、`HostedMCPTool`，都�
 
 SDK 支持 MCP Python 包的 v1 与 v2（依赖范围 `mcp>=1.19.0,<3`）。它会自动探测版本并适配 stdio/SSE/Streamable HTTP 的连接方式，普通配置不需要你切换。
 
+---
+
 ## 二、三条传输，一张表选完
 
 选传输只看两件事：server 跑在哪，用什么协议说。对照下表即可。
@@ -40,36 +49,98 @@ SDK 支持 MCP Python 包的 v1 与 v2（依赖范围 `mcp>=1.19.0,<3`）。它�
 | 远端/本地 HTTP，支持 Streamable HTTP | `MCPServerStreamableHttp` | `url`、`headers` |
 | 旧式 SSE 传输 | `MCPServerSse` | `url`、`headers` |
 
-下面这段把三种 server 都构造一遍，注意 HTTP 那个把令牌放在请求头里。
+连接一个 MCP server，下面这些配置项一个都不能少。表里按"漏了会报什么错"列全，先配齐再往下走。
+
+| 配置项 | 在哪设 | 默认值 | 漏了或设错会报什么错 |
+| --- | --- | --- | --- |
+| `command` | `MCPServerStdio` 的 `params` | 无（stdio 必填） | 不配会在构造期报缺参；写成不存在的命令会 `FileNotFoundError` |
+| `args` | `MCPServerStdio` 的 `params` | 空 | 包路径或工具根目录写错，server 起不来，握手超时 |
+| `env` | `MCPServerStdio` 的 `params` | 继承父进程 | 凭据没注入，server 启动后报鉴权失败（如 GitHub token 缺失） |
+| `cwd` | `MCPServerStdio` 的 `params` | 当前目录 | 工作目录错，相对路径找不到文件 |
+| `url`（服务端地址） | `MCPServerStreamableHttp` / `MCPServerSse` 的 `params` | 无（HTTP 必填） | 不配直接报缺参；地址写错报连接被拒或 404 |
+| 传输方式与类的对应 | 选哪个类 | 无 | 用 `MCPServerSse` 连 Streamable HTTP 端点，握手阶段就失败 |
+| `headers` 里的 `Authorization`（凭据） | 两个 HTTP 类的 `params` | 无 | 缺 token 报 401/403；写进 URL 会泄漏到日志与 trace |
+| `MCP_SERVER_TOKEN` | 环境变量（供 `headers` 读取） | 无 | `os.environ[...]` 直接抛 `KeyError`，脚本第一行就停 |
+| `client_session_timeout_seconds` | 构造参数 | `5` 秒 | npx/uvx 首次下载包会超时；报 `MCP` 会话建立失败 |
+| `cache_tools_list` | 构造参数 | `False` | 不开则每次 run 都列工具，首 token 明显变慢 |
+| `require_approval` | 构造参数 | 不要求 | 危险工具不暂停，直接执行 |
+| `tool_filter` | 构造参数 | 不过滤 | 全部工具都暴露给模型，误调用与成本上升 |
+| `OPENAI_API_KEY` | 环境变量（第 2 章） | 无 | `Runner.run` 第一次模型调用报鉴权失败 |
+
+服务端怎么起，按传输分开处理。stdio 不用你手动起，SDK 会用 `command` + `args` 把它当子进程启动并握手，你只需保证 `npx`/`uvx` 在 PATH 里。
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+npx --version
+```
+
+能看到版本号就够了。HTTP 两类 server 必须你先在另一个终端起好服务，仓库自带的可直接用的有两个。
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+# Streamable HTTP server，监听 http://localhost:8000/mcp
+uv run python examples/mcp/manager_example/mcp_server.py
+```
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+# prompt server，监听 http://127.0.0.1:18080/mcp
+uv run python examples/mcp/prompt_server/server.py
+```
+
+跑完实验记得在这两个终端按 `Ctrl-C` 停掉。下面这段把三种 server 都构造一遍，注意 HTTP 那个把令牌放在请求头里。运行前先设 token，否则 `os.environ[...]` 会抛 `KeyError`。
+
+```bash
+# macOS / Linux —— 当前终端会话
+export MCP_SERVER_TOKEN=replace-me
+```
+
+把它存成 `three_transports.py`，放在 SDK 根目录 `openai-agents-python/` 下。
 
 ```python
 import os
 
 from agents.mcp import MCPServerSse, MCPServerStdio, MCPServerStreamableHttp
 
-stdio_server = MCPServerStdio(
-    name="Filesystem",
-    params={"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]},
-    client_session_timeout_seconds=30,
-)
 
-http_server = MCPServerStreamableHttp(
-    name="Internal tools",
-    params={
-        "url": "http://localhost:8000/mcp",
-        "headers": {"Authorization": f"Bearer {os.environ['MCP_SERVER_TOKEN']}"},
-        "timeout": 10,
-    },
-    cache_tools_list=True,
-)
+def main() -> None:
+    stdio_server = MCPServerStdio(
+        name="Filesystem",
+        params={"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]},
+        client_session_timeout_seconds=30,
+    )
 
-legacy_sse_server = MCPServerSse(
-    name="Legacy SSE",
-    params={"url": "http://localhost:8000/sse"},
-)
+    http_server = MCPServerStreamableHttp(
+        name="Internal tools",
+        params={
+            "url": "http://localhost:8000/mcp",
+            "headers": {"Authorization": f"Bearer {os.environ['MCP_SERVER_TOKEN']}"},
+            "timeout": 10,
+        },
+        cache_tools_list=True,
+    )
+
+    legacy_sse_server = MCPServerSse(
+        name="Legacy SSE",
+        params={"url": "http://localhost:8000/sse"},
+    )
+
+    for server in (stdio_server, http_server, legacy_sse_server):
+        print(server.name)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-预期结果：三个对象都能构造成功，但此时还没连上 server，要等下一节的 `connect()`。
+在 SDK 根目录运行它：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python three_transports.py
+```
+
+预期结果：三个对象都能构造成功并打印名字，但此时还没连上 server，要等下一节的 `connect()`。
 
 > 注意：MCP 项目已把 SSE 传输标记为废弃。新接入优先 stdio（本地）或 Streamable HTTP（远端），SSE 只用于兼容老 server。
 
@@ -81,13 +152,17 @@ legacy_sse_server = MCPServerSse(
 | `max_retry_attempts` 与 `retry_backoff_seconds_base` | 对 `list_tools`/`call_tool` 自动重试 |
 | `use_structured_content` | 优先用 `structuredContent` 而不是文本内容 |
 
+---
+
 ## 三、生命周期：connect / cleanup 与 MCPServerManager
 
 MCP server 不是"构造完就能用"的。`MCPServer` 是抽象基类，明确要求你先 `await server.connect()`，用完 `await server.cleanup()`。
 
-最省事的写法是 `async with`，下面这段把连接、run、清理收在一个块里。
+最省事的写法是 `async with`，下面这段把连接、run、清理收在一个块里。把它存成 `mcp_lifecycle.py`，放在 SDK 根目录 `openai-agents-python/` 下。
 
 ```python
+import asyncio
+
 from agents import Agent, Runner
 from agents.mcp import MCPServerStdio
 
@@ -104,15 +179,30 @@ async def main() -> None:
         )
         result = await Runner.run(agent, "List the files you can read.")
         print(result.final_output)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+在 SDK 根目录运行它：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python mcp_lifecycle.py
 ```
 
 预期结果：进入 `with` 时 server 启动并握手，退出时自动清理，不会留下子进程。
 
-`async with` 背后就是 `__aenter__` 到 `connect()`、`__aexit__` 到 `cleanup()`。**必须在同一个任务里连接和清理**，因为 stdio server 是一个子进程，跨任务清理会留下僵尸进程或悬空管道。
+`async with` 背后就是 `__aenter__` 到 `connect()`、`__aexit__` 到 `cleanup()`。必须在同一个任务里连接和清理，因为 stdio server 是一个子进程，跨任务清理会留下僵尸进程或悬空管道。
 
-server 一多，逐个 `async with` 就难看了，而且"某一个连不上就全崩"也不合适。`MCPServerManager` 解决的就是这个问题。
+server 一多，逐个 `async with` 就难看了，而且"某一个连不上就全崩"也不合适。`MCPServerManager` 解决的就是这个问题。运行它之前，先在另一个终端按上一节命令起好 Streamable HTTP server；第二个 `8001` 端口故意留空，用来演示失败项。
+
+把它存成 `mcp_manager.py`，放在 SDK 根目录 `openai-agents-python/` 下。
 
 ```python
+import asyncio
+
 from agents import Agent, Runner
 from agents.mcp import MCPServerManager, MCPServerStreamableHttp
 
@@ -120,6 +210,7 @@ servers = [
     MCPServerStreamableHttp(name="calendar", params={"url": "http://localhost:8000/mcp"}),
     MCPServerStreamableHttp(name="docs", params={"url": "http://localhost:8001/mcp"}),
 ]
+
 
 async def main() -> None:
     async with MCPServerManager(servers) as manager:
@@ -133,6 +224,17 @@ async def main() -> None:
 
     for server in manager.failed_servers:
         print("failed:", server.name, manager.errors.get(server))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+在 SDK 根目录运行它：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python mcp_manager.py
 ```
 
 预期结果：连上的 server 出现在 `active_servers` 里并参与 run，连不上的留在 `failed_servers`，原因在 `errors` 里按 server 索引。
@@ -144,24 +246,48 @@ async def main() -> None:
 - `reconnect(failed_only=True)` 重试失败的，`False` 重启全部。`connect_all()`/`cleanup_all()`/`reconnect()` 是串行的，不会并发操作同一批连接。
 - `connect_timeout_seconds`、`cleanup_timeout_seconds` 默认 10 秒；传 0 会被拒绝，因为那等于立刻超时。
 
+---
+
 ## 四、agent.mcp_servers 与 mcp_config
 
 把 server 交给 Agent 只需要一个字段：`mcp_servers=[...]`。每次 run，Agent 都会对这些 server 调一次 `list_tools()`，把结果转成 `FunctionTool` 一起给模型。
 
-转换行为由 `mcp_config` 控制，下面这段把三个开关都打开。
+转换行为由 `mcp_config` 控制，下面这段把三个开关都打开。存成 `mcp_config_demo.py`，放在 SDK 根目录 `openai-agents-python/` 下。
 
 ```python
-from agents import Agent
+import asyncio
 
-agent = Agent(
-    name="Ops assistant",
-    mcp_servers=[filesystem_server],
-    mcp_config={
-        "convert_schemas_to_strict": True,
-        "failure_error_function": None,
-        "include_server_in_tool_names": True,
-    },
-)
+from agents import Agent
+from agents.mcp import MCPServerStdio
+
+
+async def main() -> None:
+    filesystem_server = MCPServerStdio(
+        name="Filesystem",
+        params={"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]},
+    )
+    async with filesystem_server:
+        agent = Agent(
+            name="Ops assistant",
+            mcp_servers=[filesystem_server],
+            mcp_config={
+                "convert_schemas_to_strict": True,
+                "failure_error_function": None,
+                "include_server_in_tool_names": True,
+            },
+        )
+        print(agent.name)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+在 SDK 根目录运行它：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python mcp_config_demo.py
 ```
 
 预期结果：MCP 工具以 strict schema、抛异常模式、带 server 前缀的名字进入工具列表。
@@ -178,15 +304,19 @@ server 级别还能覆盖 `mcp_config["failure_error_function"]`：构造 `MCPSe
 
 `convert_schemas_to_strict` 值得多说一句。MCP server 的 schema 往往来自 OpenAPI 或手写 JSON Schema，可能含 `additionalProperties: {}`、`$ref` 兄弟关键字、`oneOf` 等 strict 不接受的东西。
 
-转换是"尽力而为"，转不动就静默保留。所以**不要把 strict 当成保证**，需要确定性时在 `instructions` 里把参数格式写清。
+转换是"尽力而为"，转不动就静默保留。所以不要把 strict 当成保证，需要确定性时在 `instructions` 里把参数格式写清。
+
+---
 
 ## 五、工具筛选、分页与缓存
 
 一个文件系统 server 可能暴露二十个工具，而你只想给模型三个。筛法有两种，静态与动态。
 
-下面这段两种都写了：静态用 allow/block 名单，动态按 Agent 与工具名判断。
+下面这段两种都写了：静态用 allow/block 名单，动态按 Agent 与工具名判断。存成 `mcp_filter.py`，放在 SDK 根目录 `openai-agents-python/` 下。
 
 ```python
+import asyncio
+
 from agents.mcp import MCPServerStdio, ToolFilterContext, create_static_tool_filter
 
 filesystem_server = MCPServerStdio(
@@ -202,6 +332,23 @@ async def context_aware_filter(context: ToolFilterContext, tool) -> bool:
     if context.agent.name == "Code Reviewer" and tool.name.startswith("danger_"):
         return False
     return True
+
+
+async def main() -> None:
+    async with filesystem_server:
+        tools = await filesystem_server.list_tools()
+        print([t.name for t in tools])
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+在 SDK 根目录运行它：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python mcp_filter.py
 ```
 
 预期结果：只读的两个工具留在列表里，`write_file` 被剔除；动态筛选那条在 Code Reviewer 下还会额外挡掉 `danger_` 开头的工具。
@@ -210,7 +357,9 @@ async def context_aware_filter(context: ToolFilterContext, tool) -> bool:
 
 分页是自动的。`list_tools()` 与 `list_prompts()` 会自动跟随 `nextCursor`，把完整列表收齐后再应用过滤与缓存。中途某页失败，或 server 重复返回同一 cursor，会直接报错，而不是给你一个"半截工具列表"。`list_resources()` 仍是手动分页。
 
-缓存用 `cache_tools_list=True`。默认每次 run 都调 `list_tools()`，远端 server 会明显拖慢首 token；只有在你确信工具定义不常变时才开缓存，需要刷新时调 `server.invalidate_tools_cache()`。缓存返回的是**深拷贝**，改它不会污染缓存。
+缓存用 `cache_tools_list=True`。默认每次 run 都调 `list_tools()`，远端 server 会明显拖慢首 token；只有在你确信工具定义不常变时才开缓存，需要刷新时调 `server.invalidate_tools_cache()`。缓存返回的是深拷贝，改它不会污染缓存。
+
+---
 
 ## 六、审批：require_approval
 
@@ -224,29 +373,49 @@ MCP 工具最危险的地方是"你能做的它都能做"。三个本地 server 
 | `{"always": {"tool_names": [...]}, "never": {"tool_names": [...]}}` | 分组写法 |
 | 可调用对象 `(run_context, agent, tool) -> bool` | 按上下文与工具元数据动态判定 |
 
-下面这段只对写操作要审批，并在循环里逐项批准。
+下面这段只对写操作要审批，并在循环里逐项批准。存成 `mcp_approval.py`，放在 SDK 根目录 `openai-agents-python/` 下。
 
 ```python
-async with MCPServerStdio(
-    params={"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]},
-    require_approval={"always": {"tool_names": ["write_file", "delete_file"]}},
-) as server:
-    agent = Agent(name="Filesystem agent", mcp_servers=[server])
-    result = await Runner.run(agent, "Create a file named todo.txt.")
-    while result.interruptions:
-        state = result.to_state()
-        for item in result.interruptions:
-            state.approve(item)
-        result = await Runner.run(agent, state)
+import asyncio
+
+from agents import Agent, Runner
+from agents.mcp import MCPServerStdio
+
+
+async def main() -> None:
+    async with MCPServerStdio(
+        params={"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]},
+        require_approval={"always": {"tool_names": ["write_file", "delete_file"]}},
+    ) as server:
+        agent = Agent(name="Filesystem agent", mcp_servers=[server])
+        result = await Runner.run(agent, "Create a file named todo.txt.")
+        while result.interruptions:
+            state = result.to_state()
+            for item in result.interruptions:
+                state.approve(item)
+            result = await Runner.run(agent, state)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+在 SDK 根目录运行它：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python mcp_approval.py
 ```
 
 预期结果：第一次 run 在写文件前停下，`interruptions` 里出现待审批项；批准后重跑才真正创建文件。
 
-关键差异在这儿：**MCP 的 `require_approval` 可调用对象拿不到本次调用的参数与 call_id**。这两样是 `FunctionTool.needs_approval` 才有的，MCP 侧只能看 `run_context`、`agent` 和 server 提供的 `Tool` 元数据。
+关键差异在这儿：MCP 的 `require_approval` 可调用对象拿不到本次调用的参数与 call_id。这两样是 `FunctionTool.needs_approval` 才有的，MCP 侧只能看 `run_context`、`agent` 和 server 提供的 `Tool` 元数据。
 
 所以"按参数判断该不该批准"在 MCP 侧做不到，只能按工具名或业务上下文判断。server 给的 `annotations` 只是提示，不要无条件信任。
 
 另外，本地 server 类还支持 `tool_input_guardrails`/`tool_output_guardrails`。这些护栏会挂到过滤后剩下的每个工具上，与函数工具的护栏走同一条执行管线。
+
+---
 
 ## 七、本地 server vs 托管 MCP
 
@@ -261,9 +430,11 @@ async with MCPServerStdio(
 | 审批 | `require_approval` 策略 | `tool_config["require_approval"]` 加 `on_approval_request` |
 | 适合 | 内部系统、需要审计的动作 | 公开 SaaS、连接器（如日历、Wiki） |
 
-选择标准很朴素：**server 能不能被公网访问、你需不需要在调用前拦一道**。两个都要 → 本地；只要能用、且平台侧足够可信 → 托管。
+选择标准很朴素：server 能不能被公网访问、你需不需要在调用前拦一道。两个都要 → 本地；只要能用、且平台侧足够可信 → 托管。
 
 还有一个容易被忽略的差异。本地 server 的 `list_tools()` 结果参与 SDK 的工具名冲突检测、`is_enabled` 求值和护栏；托管 MCP 的工具完全在平台侧展开，这些 SDK 侧的控制一律不生效。如果你的权限模型依赖这些机制，就只能选本地。
+
+---
 
 ## 八、工具名冲突与 include_server_in_tool_names
 
@@ -271,13 +442,23 @@ async with MCPServerStdio(
 
 默认 `include_server_in_tool_names=False`，名字保持 server 原样。打开后变成 `mcp_<server>__<tool>`，例如 `mcp_filesystem__read_file`。生成规则保证了 ASCII 安全、长度受限，且不与同 Agent 上已启用的 `FunctionTool` 或 handoff 名字冲突。SDK 调用时仍然用原始工具名发给原始 server。
 
-打开它有代价：模型看到的工具名变长，prompt 里的引用也要跟着改。建议只在**确实存在同名工具**时才开，并把 `RunConfig(tool_name_collision_policy="error")` 一起用上，让漏网的重名在模型调用前就炸出来。
+打开它有代价：模型看到的工具名变长，prompt 里的引用也要跟着改。建议只在确实存在同名工具时才开，并把 `RunConfig(tool_name_collision_policy="error")` 一起用上，让漏网的重名在模型调用前就炸出来。
 
-## 九、完整例子：接一个文件系统 MCP server
+---
 
-先跑通官方的 filesystem server，这是验证"环境是否就绪"的最短路径。以下命令与示例都在 `repo/openai-agents-python/`（SDK 根目录）下执行；若 clone 在别处，按自己的目录替换。
+## 九、完整例子：接一个 filesystem MCP server
 
-这段把工作目录指向脚本旁的 `sample_files`，连上 server，列出工具再让它读一个文件。
+先跑通官方的 filesystem server，这是验证"环境是否就绪"的最短路径，也是本章的默认主线。以下命令与示例都在 SDK 根目录 `openai-agents-python/` 下执行；若 clone 在别处，按自己的目录替换。
+
+先造一个被读取的小文件，否则模型读不到内容。
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+mkdir -p sample_files
+printf 'Favorites: Dune, Neuromancer, The Left Hand of Darkness.\n' > sample_files/favorite_books.txt
+```
+
+这段把工作目录指向脚本旁的 `sample_files`，连上 server，列出工具再让它读一个文件。把它存成 `filesystem_example.py`，放在 SDK 根目录 `openai-agents-python/` 下。
 
 ```python
 import asyncio
@@ -322,29 +503,57 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
+在 SDK 根目录运行它：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python filesystem_example.py
+```
+
 预期输出：先打印一行 `exposed tools: [...]`，列出 server 暴露的工具名；随后打印一行摘要，内容来自 `favorite_books.txt`。
 
-换成 GitHub 只是换 `params`。GitHub 官方 MCP server 以容器镜像发布，凭据通过环境变量注入。
+换成 GitHub 只是换 `params`。GitHub 官方 MCP server 以容器镜像发布，凭据通过环境变量注入。运行前先设 token，再把它存成 `github_example.py`，放在 SDK 根目录 `openai-agents-python/` 下。
+
+```bash
+# macOS / Linux —— 当前终端会话
+export GITHUB_PERSONAL_ACCESS_TOKEN=ghp_replace_me
+```
 
 ```python
+import asyncio
 import os
 
 from agents.mcp import MCPServerStdio
 
-github_server = MCPServerStdio(
-    name="GitHub",
-    params={
-        "command": "docker",
-        "args": [
-            "run", "-i", "--rm",
-            "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
-            "ghcr.io/github/github-mcp-server",
-        ],
-        "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": os.environ["GITHUB_PERSONAL_ACCESS_TOKEN"]},
-    },
-    cache_tools_list=True,
-    require_approval={"always": {"tool_names": ["create_issue", "create_pull_request"]}},
-)
+
+async def main() -> None:
+    github_server = MCPServerStdio(
+        name="GitHub",
+        params={
+            "command": "docker",
+            "args": [
+                "run", "-i", "--rm",
+                "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
+                "ghcr.io/github/github-mcp-server",
+            ],
+            "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": os.environ["GITHUB_PERSONAL_ACCESS_TOKEN"]},
+        },
+        cache_tools_list=True,
+        require_approval={"always": {"tool_names": ["create_issue", "create_pull_request"]}},
+    )
+    async with github_server:
+        print(github_server.name)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+在 SDK 根目录运行它：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python github_example.py
 ```
 
 预期结果：`create_issue` 与 `create_pull_request` 每次调用都要审批，其余工具直接放行。
@@ -353,20 +562,45 @@ github_server = MCPServerStdio(
 
 本地与仓库自带示例一一对应：`repo/examples/mcp/filesystem_example`（npx + 文件系统）、`repo/examples/mcp/git_example`（uvx + `mcp-server-git`）、`repo/examples/mcp/manager_example`（FastAPI + manager 生命周期）、`repo/examples/mcp/tool_filter_example`（过滤 + 审批）。
 
+---
+
 ## 十、MCP 的另外两件礼物：prompts 与 resources
 
-MCP 不只提供工具，server 还可以暴露 **prompts**（动态生成指令模板）和 **resources**（可读取的资源）。
+MCP 不只提供工具，server 还可以暴露 prompts（动态生成指令模板）和 resources（可读取的资源）。
 
-下面这段从 server 取一份 prompt 模板，直接当 Agent 的 instructions 用。
+先按第二节命令起 prompt server，它监听 `http://127.0.0.1:18080/mcp`，并提供 `generate_code_review_instructions` 这个模板。下面这段从 server 取一份 prompt 模板，直接当 Agent 的 instructions 用。存成 `mcp_prompt.py`，放在 SDK 根目录 `openai-agents-python/` 下。
 
 ```python
-prompt_result = await server.get_prompt(
-    "generate_code_review_instructions",
-    {"focus": "security vulnerabilities", "language": "python"},
-)
-instructions = prompt_result.messages[0].content.text
+import asyncio
 
-agent = Agent(name="Code Reviewer", instructions=instructions, mcp_servers=[server])
+from agents import Agent
+from agents.mcp import MCPServerStreamableHttp
+
+
+async def main() -> None:
+    async with MCPServerStreamableHttp(
+        name="Prompt server",
+        params={"url": "http://127.0.0.1:18080/mcp"},
+    ) as server:
+        prompt_result = await server.get_prompt(
+            "generate_code_review_instructions",
+            {"focus": "security vulnerabilities", "language": "python"},
+        )
+        instructions = prompt_result.messages[0].content.text
+
+        agent = Agent(name="Code Reviewer", instructions=instructions, mcp_servers=[server])
+        print(agent.name)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+在 SDK 根目录运行它：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python mcp_prompt.py
 ```
 
 预期结果：`instructions` 是平台维护的那段审查指令，改了模板下次启动即生效。
@@ -375,33 +609,60 @@ agent = Agent(name="Code Reviewer", instructions=instructions, mcp_servers=[serv
 
 这两类能力常被忽略，但在"指令由平台统一维护、多个 Agent 复用"的团队里非常实用：prompt 改了不用发版，Agent 下次启动就生效。
 
+---
+
 ## 十一、预取工具：把 MCP 工具当普通工具用
 
 有时你不想让 Agent 每次 run 都去连 server，比如启动慢的 server，或要在连不上时降级。做法是先预取工具列表，再把它们塞进 `tools`。
 
-下面这段一次性取出全部函数工具，之后 run 期间不再触发 `list_tools()`。
+下面这段一次性取出全部函数工具，之后 run 期间不再触发 `list_tools()`。存成 `mcp_prefetch.py`，放在 SDK 根目录 `openai-agents-python/` 下。
 
 ```python
+import asyncio
+
 from agents import Agent, RunContextWrapper
+from agents.mcp import MCPServerStdio
 from agents.mcp.util import MCPUtil
 
-run_context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
-fetcher = Agent(name="Tool fetcher", instructions="Prefetch MCP tools.")
 
-prefetched = await MCPUtil.get_all_function_tools(
-    [server],
-    convert_schemas_to_strict=True,
-    run_context=run_context,
-    agent=fetcher,
-)
-agent = Agent(name="Prefetched assistant", tools=prefetched)
+async def main() -> None:
+    async with MCPServerStdio(
+        name="Filesystem",
+        params={"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]},
+    ) as server:
+        run_context: RunContextWrapper[dict[str, str]] = RunContextWrapper(context={})
+        fetcher = Agent(name="Tool fetcher", instructions="Prefetch MCP tools.")
+
+        prefetched = await MCPUtil.get_all_function_tools(
+            [server],
+            convert_schemas_to_strict=True,
+            run_context=run_context,
+            agent=fetcher,
+        )
+        agent = Agent(name="Prefetched assistant", tools=prefetched)
+        print(agent.name, len(agent.tools))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+在 SDK 根目录运行它：
+
+```bash
+# 工作目录：openai-agents-python/（SDK 根目录）
+python mcp_prefetch.py
 ```
 
 预期结果：`agent` 的 `tools` 里已经是普通 `FunctionTool`，`mcp_servers` 留空也不影响运行。
 
 这样 `agent.mcp_servers` 可以是空的，工具在 run 期间不再触发 `list_tools()`。代价是你自己承担"工具列表过期"的风险，需要刷新时重新预取。仓库里 `repo/examples/mcp/get_all_mcp_tools_example` 就是这条路线。
 
+---
+
 ## 常见坑与排查
+
+按症状查，每条都给出"症状 → 原因 → 修法"。
 
 1. **`RuntimeError: Attempted to exit cancel scope in a different task`**
    症状：run 结束后异常退出，报 cancel scope 不在同一任务。
@@ -428,22 +689,29 @@ agent = Agent(name="Prefetched assistant", tools=prefetched)
    原因：MCP 的 `require_approval` 回调只给 `(run_context, agent, tool)`。
    修法：把授权判断下沉到 server 侧，或改用本地 function 工具包一层。
 
+---
+
 ## 动手练习
 
-以下练习都在 `repo/openai-agents-python/`（SDK 根目录）下执行；若 clone 在别处，按自己的目录替换。
+本章练习都在 SDK 根目录 `openai-agents-python/` 下执行；若 clone 在别处，按自己的目录替换。
 
 1. 用 `MCPServerStdio` 接 filesystem server，打印 `list_tools()` 的结果，再用 `create_static_tool_filter` 只保留只读工具，验证写操作确实不可见。
 2. 改成 `MCPServerManager` 同时接 filesystem 与 git 两个 server，故意把其中一个的 `command` 写错，观察 `active_servers`、`failed_servers`、`errors` 的差异，再用 `reconnect(failed_only=True)` 重试。
 3. 打开 `repo/examples/mcp/tool_filter_example/main.py`，把 `require_approval="always"` 改成只对 `read_file` 要求审批，并让 `run_with_auto_approval` 拒绝一次，观察模型收到拒绝后的回答。
 
+---
+
 ## 本章小结
 
 - MCP 是开放协议，SDK 是它的客户端；工具语义由 server 决定，你只能过滤与包装。
-- 三条传输：stdio（本地进程）、Streamable HTTP（首选远端）、SSE（仅兼容）。
+- 三条传输：stdio（本地进程）、Streamable HTTP（首选远端）、SSE（仅兼容）；stdio 由 SDK 起子进程，HTTP 要你先起服务。
 - 生命周期必须"同任务 connect/cleanup"，多 server 用 `MCPServerManager` 只暴露连上的那部分。
 - `mcp_config` 三个开关：strict 转换（尽力）、失败文案、server 名前缀；`require_approval` 支持五种写法，但回调拿不到单次参数。
 - 本地 server 能审计能加护栏；`HostedMCPTool` 省事但把参数交给了平台。
 - MCP 还能提供 prompts（指令可平台化维护）与 resources；启动慢或需要降级时，用 `MCPUtil.get_all_function_tools` 预取工具，让 `mcp_servers` 保持为空。
+- 脚本都放 `openai-agents-python/`，先跑第九节 filesystem 主线，凭据放 `Authorization` 头不要放 URL。
+
+---
 
 ## 延伸阅读
 
